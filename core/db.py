@@ -38,7 +38,10 @@ def init_db() -> None:
     schema_path = os.path.join(os.path.dirname(__file__), "..", "config", "schema.sql")
     with open(schema_path, "r", encoding="utf-8") as fh:
         statements = [s.strip() for s in fh.read().split(";") if s.strip()]
-    with engine.begin() as conn:
+    # AUTOCOMMIT: each statement stands alone. In a single transaction one
+    # failure would abort the rest on Postgres (InFailedSqlTransaction cascade).
+    with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         for stmt in statements:
             try:
                 conn.execute(text(pg_compatible(stmt)))
