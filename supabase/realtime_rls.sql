@@ -32,8 +32,27 @@ create policy "anon read weights"          on strategy_weights for select using 
 create policy "anon read state"            on system_state     for select using (true);
 create policy "anon read backtests"        on backtest_results for select using (true);
 
+-- Engine writes over a DIRECT Postgres connection as role `tradingbot`
+-- (created manually; password lives in DATABASE_URL on Render). Give it
+-- full DML on every public table, plus schema CREATE for aux tables.
+DO $$
+DECLARE t record;
+BEGIN
+  FOR t IN SELECT tablename FROM pg_tables WHERE schemaname='public' LOOP
+    BEGIN
+      EXECUTE format('DROP POLICY IF EXISTS "engine all access" ON public.%I', t.tablename);
+      EXECUTE format('CREATE POLICY "engine all access" ON public.%I FOR ALL TO tradingbot USING (true) WITH CHECK (true)', t.tablename);
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'skip %: %', t.tablename, SQLERRM;
+    END;
+  END LOOP;
+END $$;
+GRANT USAGE, CREATE ON SCHEMA public TO tradingbot;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO tradingbot;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO tradingbot;
+
 -- No INSERT/UPDATE/DELETE policies for anon -> all writes denied for anon.
--- (Engine writes with SUPABASE_SERVICE_KEY, which bypasses RLS.)
+-- (Dashboard control endpoints use the service key server-side.)
 
 -- Dashboard control endpoints (pause/close) use the service key server-side,
 -- so no anon write policies exist. system_state stays read-only to the world.
