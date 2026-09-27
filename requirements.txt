@@ -40,8 +40,9 @@ pytest==9.1.1
 # MetaTrader5==5.0.4522
 
 # --- cTrader Open API (Linux-native broker; Pepperstone/IC Markets etc.) ---
-ctrader-open-api==0.9.2
-service-identity==26.1.0
+# OPTIONAL: installed on demand (its pyOpenSSL pin conflicts with supabase in a
+# fresh resolve). The connector guards the import; engine runs fine without it:
+#   pip install ctrader-open-api==0.9.2 service-identity==26.1.0
 
 # Note: pandas_ta is intentionally NOT used - all indicators are computed
 # in-house via pandas (data/indicator_engine.py, strategies/base_strategy.py).
