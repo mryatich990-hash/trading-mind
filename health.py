@@ -65,6 +65,20 @@ def _supervisor_alive() -> str:
         return f"err:{exc}"[:60]
 
 
+def _child_log_tail(lines: int = 25) -> str:
+    """Tail of the engine child log (crash diagnosis without log-API access)."""
+    try:
+        from pathlib import Path
+
+        p = Path("/tmp/child.log")
+        if not p.exists():
+            return "(no child.log yet)"
+        content = p.read_text(errors="replace").splitlines()
+        return "\n".join(content[-lines:])[-2000:]
+    except Exception as exc:
+        return f"err:{exc}"[:200]
+
+
 @app.route("/health")
 def health():
     """Liveness probe: 200 while the process runs; detailed status in body.
@@ -89,6 +103,7 @@ def health():
         "database_error": db_detail,
         "engine": "alive" if _engine_alive() else "starting",
         "supervisor": _supervisor_alive(),
+        "child_log": _child_log_tail(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 

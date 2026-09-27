@@ -36,15 +36,23 @@ def _write_heartbeat() -> None:
 
 
 def main() -> None:
+    # Child stdout+stderr -> /tmp/child.log so /health can surface crashes
+    # (Render's log API is unavailable on this workspace).
+    logf = open("/tmp/child.log", "a", buffering=1)
     while True:  # supervisor loop: restart engine if it ever exits
+        logf.write(f"\n[run_engine] starting engine child: main.py at {time.strftime('%H:%M:%S')}\n")
         print("[run_engine] starting engine child: main.py", flush=True)
-        child = subprocess.Popen([sys.executable, "main.py"], cwd=str(ROOT))
+        child = subprocess.Popen(
+            [sys.executable, "-u", "main.py"], cwd=str(ROOT),
+            stdout=logf, stderr=subprocess.STDOUT,
+        )
         last_beat = 0.0
         while True:
             code = child.poll()
             if code is not None:
-                print(f"[run_engine] engine exited with {code}; restarting in 10s",
-                      flush=True)
+                logf.write(f"[run_engine] engine exited with code {code}\n")
+                logf.flush()
+                print(f"[run_engine] engine exited with {code}; restarting in 10s", flush=True)
                 time.sleep(10)
                 break
             if time.time() - last_beat >= HEARTBEAT_SEC:
