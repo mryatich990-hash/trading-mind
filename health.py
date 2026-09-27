@@ -52,17 +52,26 @@ def _engine_alive() -> bool:
 
 @app.route("/health")
 def health():
-    """Liveness probe. 200 only when the DB is reachable."""
+    """Liveness probe: 200 while the process runs; detailed status in body.
+
+    Always-200 keeps the Render health check and UptimeRobot pings working
+    even when the database is unreachable — the JSON body carries the exact
+    DB error so operators can diagnose remotely (e.g. pooler auth issues).
+    """
+    db_status, db_detail = "unknown", ""
     try:
         from core.db import get_state
 
         get_state("engine_heartbeat", "")  # cheap DB roundtrip
+        db_status = "connected"
     except Exception as exc:
-        return jsonify({"status": "error", "database": "down", "error": str(exc)}), 500
+        db_status = "down"
+        db_detail = f"{type(exc).__name__}: {exc}"[:300]
 
     return jsonify({
         "status": "running",
-        "database": "connected",
+        "database": db_status,
+        "database_error": db_detail,
         "engine": "alive" if _engine_alive() else "starting",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
