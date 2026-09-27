@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Trading Bot Dashboard</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+--green:#3fb950;--red:#f85149;--amber:#d29922;--blue:#58a6ff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:14px/1.45 -apple-system,'Segoe UI',Roboto,sans-serif;padding:10px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:14px 0 6px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:8px}
+.row{display:flex;gap:8px;flex-wrap:wrap}
+.stat{flex:1;min-width:100px}
+.stat .v{font-size:20px;font-weight:700}
+.stat .l{font-size:11px;color:var(--muted)}
+.badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700}
+.b-green{background:rgba(63,185,80,.15);color:var(--green)}
+.b-red{background:rgba(248,81,73,.15);color:var(--red)}
+.b-amber{background:rgba(210,153,34,.15);color:var(--amber)}
+.b-blue{background:rgba(88,166,255,.15);color:var(--blue)}
+.b-muted{background:rgba(139,148,158,.15);color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{color:var(--muted);text-align:left;font-weight:600;padding:4px;border-bottom:1px solid var(--border)}
+td{padding:4px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+.pos{color:var(--green)}.neg{color:var(--red)}
+button{background:var(--blue);color:#fff;border:none;border-radius:6px;padding:8px 12px;font-size:13px;font-weight:600;margin:2px}
+button.warn{background:var(--red)}
+button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+.gauge{height:8px;border-radius:4px;background:var(--border);overflow:hidden;margin:4px 0}
+.gauge>div{height:100%;border-radius:4px}
+.banner{padding:8px 12px;border-radius:8px;font-weight:700;margin-bottom:8px;text-align:center}
+.banner.halt{background:rgba(248,81,73,.2);color:var(--red)}
+.small{font-size:11px;color:var(--muted)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+@media(max-width:420px){.grid{grid-template-columns:1fr}}
+canvas{max-width:100%}
+.mono{font-variant-numeric:tabular-nums}
+details summary{cursor:pointer;color:var(--blue);font-size:11px}
+</style>
+</head>
+<body>
+
+<div id="breaker-banner" class="banner halt" style="display:none"></div>
+
+<h2>Status</h2>
+<div class="card" id="s1">
+  <div class="row">
+    <div class="stat"><div class="v" id="st-status">—</div><div class="l">Bot mode</div></div>
+    <div class="stat"><div class="v" id="st-session">—</div><div class="l">Session</div></div>
+    <div class="stat"><div class="v" id="st-regime">—</div><div class="l">Regime (Groq)</div></div>
+    <div class="stat"><div class="v" id="st-vix">—</div><div class="l">VIX</div></div>
+  </div>
+</div>
+
+<h2>Account</h2>
+<div class="card" id="s2">
+  <div class="row">
+    <div class="stat"><div class="v mono" id="ac-pnl">—</div><div class="l">Today PnL</div></div>
+    <div class="stat"><div class="v mono" id="ac-trades">—</div><div class="l">Trades today</div></div>
+    <div class="stat"><div class="v mono" id="ac-open">—</div><div class="l">Open trades</div></div>
+    <div class="stat"><div class="v mono" id="ac-dd">—</div><div class="l">Drawdown</div></div>
+  </div>
+  <canvas id="equity-chart" height="120"></canvas>
+</div>
+
+<h2>Quick Actions</h2>
+<div class="card">
+  <button onclick="control('pause')">Pause Bot</button>
+  <button onclick="control('resume')">Resume Bot</button>
+  <button class="warn" onclick="control('close_all')">Close All Trades</button>
+  <button class="ghost" onclick="control('montecarlo')">Run Monte Carlo</button>
+</div>
+
+<h2>Open Trades <span class="small">(10s refresh)</span></h2>
+<div class="card"><table id="open-trades"><thead>
+<tr><th>Pair</th><th>Dir</th><th>Lots</th><th>Entry</th><th>SL</th><th>TP</th><th>Strategy</th><th>Age</th></tr>
+</thead><tbody></tbody></table></div>
+
+<h2>Research Live Feed</h2>
+<div class="card"><table id="research"><thead>
+<tr><th>Time</th><th>Pair</th><th>Result</th><th>Conf</th><th>Conv</th><th>Reason</th></tr>
+</thead><tbody></tbody></table></div>
+
+<h2>Institutional Panel</h2>
+<div class="card grid">
+  <div><b>COT (commercial vs non-commercial)</b><div id="cot-list" class="small"></div></div>
+  <div><b>Intermarket bias</b><div id="bias-list" class="small"></div></div>
+  <div><b>Retail sentiment</b><div id="retail-list" class="small"></div></div>
+  <div><b>VIX (last readings)</b><div id="vix-list" class="small"></div></div>
+</div>
+
+<h2>Strategy Performance</h2>
+<div class="card"><table id="strategies"><thead>
+<tr><th>Strategy</th><th>Signals</th><th>WR</th><th>PnL</th><th>Weight</th><th>State</th></tr>
+</thead><tbody></tbody></table></div>
+
+<h2>Session Heatmap</h2>
+<div class="card"><div id="heatmap" class="small">No data yet (needs trades).</div></div>
+
+<h2>Monte Carlo</h2>
+<div class="card" id="montecarlo">No simulation yet. Hit "Run Monte Carlo".</div>
+
+<h2>ML Model</h2>
+<div class="card" id="ml-status">No model metrics yet.</div>
+
+<h2>Trade History</h2>
+<div class="card">
+<div>
+<select id="f-pair"><option value="">All pairs</option></select>
+<select id="f-outcome"><option value="">All</option><option value="win">Wins</option><option value="loss">Losses</option></select>
+<button class="ghost" onclick="loadHistory()">Filter</button>
+</div>
+<table id="history"><thead>
+<tr><th>Time</th><th>Pair</th><th>Dir</th><th>Pips</th><th>PnL</th><th>Strat</th><th>Conf</th></tr>
+</thead><tbody></tbody></table>
+</div>
+
+<div class="small" style="text-align:center;margin:12px 0">
+All times EAT (UTC+3) · auto-refresh {{ refresh_sec }}s
+</div>
+
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+.git
+__pycache__
+*.pyc
+.env
+.pytest_cache
+logs/
+*.joblib
+*.png
+instance/

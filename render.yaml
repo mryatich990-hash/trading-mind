@@ -1,0 +1,58 @@
+# Render blueprint: trading bot engine + health endpoint in ONE web service.
+#
+# Why a single `web` service (not the classic worker+web pair): Render's
+# worker tier has NO free plan ($7+/mo). The free web tier serves health.py
+# (UptimeRobot pings it) and hosts the engine via deploy/run_engine.py.
+#
+# Deploy: render.com -> New + -> Blueprint -> connect this repo.
+# Then set env vars in Dashboard -> trading-bot -> Environment.
+
+services:
+  - type: web
+    name: trading-bot
+    env: python
+    plan: free
+    region: frankfurt          # closest free region to Kenya
+    branch: main
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "bash deploy/start_render.sh"
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: ENVIRONMENT
+        value: production
+      - key: DEMO_MODE
+        value: "true"
+      - key: RUN_ENGINE
+        value: "0"            # gunicorn must NOT spawn a second engine;
+                              # deploy/start_render.sh owns engine startup
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: ALPHA_VANTAGE_API_KEY
+        sync: false
+      - key: TWELVE_DATA_API_KEY
+        sync: false
+      - key: CTRADER_CLIENT_ID
+        sync: false
+      - key: CTRADER_CLIENT_SECRET
+        sync: false
+      - key: CTRADER_ACCOUNT_ID
+        sync: false
+      - key: CTRADER_ACCESS_TOKEN
+        sync: false
+      - key: CTRADER_REFRESH_TOKEN
+        sync: false
+      - key: CTRADER_ENV
+        value: demo
+      - key: TRADING_PAIRS
+        value: EURUSD,GBPUSD,XAUUSD,USDJPY,GBPJPY,EURJPY,NAS100,US30,USDCHF,AUDUSD

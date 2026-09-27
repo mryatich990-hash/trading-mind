@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Environment / secrets
+.env
+
+# Local databases
+*.db
+*.sqlite*
+
+# Logs / artifacts
+logs/
+*.log
+data_cache/
+/data/models/*.joblib
+
+# OS
+.DS_Store

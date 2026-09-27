@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login — Forex Bot</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a; color: #e2e8f0;
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; padding: 16px;
+    }
+    .card {
+      background: #1e293b; border-radius: 12px; padding: 32px;
+      width: 100%; max-width: 380px; box-shadow: 0 10px 40px rgba(0,0,0,.4);
+    }
+    h1 { font-size: 1.3rem; margin-bottom: 20px; text-align: center; }
+    label { display: block; font-size: .85rem; margin: 12px 0 6px; color: #94a3b8; }
+    input {
+      width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #334155;
+      background: #0f172a; color: #e2e8f0; font-size: 1rem;
+    }
+    button {
+      width: 100%; margin-top: 20px; padding: 12px; border: none; border-radius: 8px;
+      background: #2563eb; color: white; font-size: 1rem; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    .error { color: #f87171; margin-top: 12px; text-align: center; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🤖 Forex Bot Dashboard</h1>
+    <form method="POST">
+      <label>Username</label>
+      <input name="username" autocomplete="username" required>
+      <label>Password</label>
+      <input name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+      {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    </form>
+  </div>
+</body>
+</html>

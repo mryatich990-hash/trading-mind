@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Forex Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading-bot
+ExecStart=%h/trading-bot/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=10
+# stdout/stderr land in the same log file the bot used before
+StandardOutput=append:%h/trading-bot/logs/bot.log
+StandardError=append:%h/trading-bot/logs/bot.log
+
+[Install]
+WantedBy=default.target
