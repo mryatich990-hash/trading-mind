@@ -10,18 +10,24 @@ Keeps the same restart-on-crash semantics as the local systemd unit.
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 HEARTBEAT_SEC = 30
 
 ROOT = Path(__file__).resolve().parent.parent
+BEAT_FILE = Path("/tmp/engine.beat")
 
 
 def _write_heartbeat() -> None:
-    """Best-effort heartbeat write (engine is fine even if this fails)."""
+    """Heartbeat: file (always works) + DB state key (best-effort)."""
+    try:
+        BEAT_FILE.write_text(str(time.time()))
+    except Exception:
+        pass
     try:
         sys.path.insert(0, str(ROOT))
+        from datetime import datetime, timezone
+
         from core.db import set_state
 
         set_state("engine_heartbeat", datetime.now(timezone.utc).isoformat())

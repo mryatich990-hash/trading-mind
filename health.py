@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,6 +51,20 @@ def _engine_alive() -> bool:
         return False
 
 
+def _supervisor_alive() -> str:
+    """File-based supervisor heartbeat (/tmp/engine.beat, written every 30s)."""
+    try:
+        from pathlib import Path
+
+        p = Path("/tmp/engine.beat")
+        if not p.exists():
+            return "no-file"
+        age = time.time() - float(p.read_text().strip())
+        return f"fresh({int(age)}s)" if age < 90 else f"stale({int(age)}s)"
+    except Exception as exc:
+        return f"err:{exc}"[:60]
+
+
 @app.route("/health")
 def health():
     """Liveness probe: 200 while the process runs; detailed status in body.
@@ -73,6 +88,7 @@ def health():
         "database": db_status,
         "database_error": db_detail,
         "engine": "alive" if _engine_alive() else "starting",
+        "supervisor": _supervisor_alive(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
