@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading bot overnight watchdog (Render keep-alive + Telegram alerts)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/trading-bot
+ExecStart=%h/trading-bot/.venv/bin/python %h/trading-bot/deploy/watchdog.py
+Restart=always
+RestartSec=30
+StandardOutput=append:%h/trading-bot/logs/watchdog.log
+StandardError=append:%h/trading-bot/logs/watchdog.log
+
+[Install]
+WantedBy=default.target
