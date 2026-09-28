@@ -245,8 +245,19 @@ class UpgradeRegistry:
                 self.notifier.send(f"⚖️ StatArb closed: {reason}")
         if self.position_count() == 0:
             for opp in self.statarb.scan()[:1]:
-                if self.notifier:
-                    self.notifier.send(f"⚖️ StatArb opportunity: {opp['detail']}")
+                if not self.notifier:
+                    continue
+                # same recurring divergence would ping Telegram every 2 min;
+                # alert only on a NEW signature or after a 30 min cooldown
+                sig = str(opp.get("detail", ""))[:120]
+                now = time.time()
+                last_sig = getattr(self, "_statarb_alert_sig", None)
+                last_ts = getattr(self, "_statarb_alert_ts", 0.0)
+                if sig == last_sig and now - last_ts < 1800:
+                    continue
+                self._statarb_alert_sig = sig
+                self._statarb_alert_ts = now
+                self.notifier.send(f"⚖️ StatArb opportunity: {opp['detail']}")
 
     def position_count(self) -> int:
         """Open trades from the DB (for scalping/statarb interlocks)."""
