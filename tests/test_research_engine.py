@@ -86,6 +86,30 @@ class TestEntryValidator:
         assert not checklist.no_red_news
         assert "no_red_news" in checklist.failed_items
 
+    def test_zero_volume_feed_excludes_volume_check(self, temp_db):
+        """Yahoo FX candles are all-zero volume: the dead check must be
+        excluded from score AND denial, not veto every FX trade forever."""
+        frames = uptrend_frames()
+        frames["m15"] = frames["m15"].assign(volume=0.0)
+        htf = HTFAnalyzer().analyze("EURUSD", frames, "buy")
+        macro = MacroResult(news_gate="clear", cot_bias="neutral")
+        checklist = EntryValidator().validate("EURUSD", "buy", frames, htf, macro)
+        assert "volume_confirmed" not in checklist.failed_items
+        # 9 active checks, no bonus -> score + failed must equal 9
+        assert checklist.score + len(checklist.failed_items) == 9
+
+    def test_real_volume_feed_keeps_volume_check(self, temp_db):
+        """With genuine volume data the item stays in the checklist."""
+        frames = uptrend_frames()
+        rng = np.random.default_rng(7)
+        frames["m15"] = frames["m15"].assign(
+            volume=rng.integers(500, 2000, len(frames["m15"])).astype(float))
+        htf = HTFAnalyzer().analyze("EURUSD", frames, "buy")
+        macro = MacroResult(news_gate="clear", cot_bias="neutral")
+        checklist = EntryValidator().validate("EURUSD", "buy", frames, htf, macro)
+        # 10 active checks -> score + failed must equal 10
+        assert checklist.score + len(checklist.failed_items) == 10
+
 
 class TestHistoricalMatcher:
     def test_insufficient_samples(self, temp_db):

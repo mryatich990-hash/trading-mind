@@ -96,16 +96,26 @@ class EntryValidator:
 
     def validate(self, pair: str, direction: str, frames: dict[str, pd.DataFrame],
                  htf, macro, confluence_bonus: int = 0) -> EntryChecklist:
-        """Score the 10-point checklist. htf: HTFResult, macro: MacroResult."""
+        """Score the 10-point checklist. htf: HTFResult, macro: MacroResult.
+
+        When the data feed carries no volume (Yahoo FX candles are all-zero),
+        the volume item is EXCLUDED from both score and requirement instead of
+        failing permanently — otherwise FX trades are mathematically impossible
+        (max score 7 < required 8).
+        """
         chk = EntryChecklist()
         m15, h1 = frames["m15"], frames["h1"]
         price = float(m15["close"].iloc[-1])
         direction_buy = direction == "buy"
+        m15_vol_sum = float(pd.to_numeric(m15["volume"], errors="coerce")
+                            .tail(50).fillna(0).sum())
+        volume_usable = m15_vol_sum > 0.0
 
-        # ---- step 5: volume and order flow ----
+        # step 5 volume metrics only make sense when the feed has volume
         try:
             ind_m15 = self.indicators.compute(m15, "M15")
-            chk.volume_pct = ind_m15.volume_vs_avg_pct
+            if volume_usable:
+                chk.volume_pct = ind_m15.volume_vs_avg_pct
             chk.delta_5 = ind_m15.delta_5
             chk.delta_aligned = (chk.delta_5 > 0) if direction_buy else (chk.delta_5 < 0)
             chk.at_hvn = any(abs(price - hvn) < 2 * pip_size(pair)
@@ -137,7 +147,7 @@ class EntryValidator:
         chk.rejection_candle = ok
         chk.candle_pattern = pattern
 
-        chk.volume_confirmed = chk.volume_pct >= 115.0
+        chk.volume_confirmed = volume_usable and chk.volume_pct >= 115.0
 
         try:
             e20_h1 = float(h1["close"].ewm(span=20, adjust=False).mean().iloc[-1])
@@ -167,8 +177,13 @@ class EntryValidator:
             "session_ok": chk.session_ok, "spread_ok": chk.spread_ok,
             "no_red_news": chk.no_red_news, "cot_not_against": chk.cot_not_against,
         }
+        if not volume_usable:
+            # feed has no volume data: drop the item from score AND denial
+            # list instead of letting a dead check veto every FX trade
+            checks.pop("volume_confirmed")
         chk.score = sum(1 for v in checks.values() if v) + bonus
         chk.failed_items = [k for k, v in checks.items() if not v]
-        logger.info("entry checklist %s %s: %d/10 (failed: %s)", pair, direction,
-                    chk.score, ", ".join(chk.failed_items) or "none")
+        logger.info("entry checklist %s %s: %d/%d%s (failed: %s)", pair, direction,
+                    chk.score, len(checks), "+bonus" if bonus else "",
+                    ", ".join(chk.failed_items) or "none")
         return chk
