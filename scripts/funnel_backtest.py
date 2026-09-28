@@ -27,15 +27,16 @@ from research.macro_analyzer import MacroResult
 from strategies.library import all_strategies
 from strategies.base_strategy import MarketContext
 
-PAIRS = ["EURUSD", "GBPUSD"]
+PAIRS_DEFAULT = ["EURUSD", "GBPUSD", "XAUUSD", "USDJPY", "GBPJPY", "EURJPY"]
 DAYS = 55
+RESULTS = "/home/yatich/trading-bot/scripts/funnel_backtest_results.json"
 
-_YF_MAP = {"EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X"}
+_YF_MAP = {"XAUUSD": "GC=F"}   # =X fallback covers EURUSD/GBP*/USDJPY/GBPJPY/EURJPY
 
 def _real_htf(pair: str) -> dict[str, pd.DataFrame]:
     """Fetch genuine multi-month h1/h4/d1 history like the live engine uses
     (resampling 55d of m15 gives <60 daily bars -> daily trend never forms)."""
-    sym = _YF_MAP[pair]
+    sym = _YF_MAP.get(pair, f"{pair}=X")
     d1 = _normalize(yf.download(sym, period="1y", interval="1d", progress=False))
     h1 = _normalize(yf.download(sym, period="60d", interval="1h", progress=False))
     h4 = h1.set_index("time").resample("4h").agg(
@@ -43,14 +44,30 @@ def _real_htf(pair: str) -> dict[str, pd.DataFrame]:
          "volume": "sum"}).dropna().reset_index()
     return {"h1": h1, "h4": h4, "d1": d1}
 
+def _load_previous(pairs: list[str]) -> list[dict]:
+    """Existing results, minus any records for the pairs being re-run."""
+    try:
+        with open(RESULTS) as fh:
+            old = json.load(fh)
+        return [r for r in old if r.get("pair") not in pairs]
+    except Exception:
+        return []
+
 def main() -> None:
+    pairs = [p.strip().upper() for p in (sys.argv[1].split(",") if len(sys.argv) > 1
+                                         else PAIRS_DEFAULT)]
+    print(f"pairs: {pairs}", flush=True)
     strategies = all_strategies()
     htf_an = HTFAnalyzer()
     validator = EntryValidator()
     macro = MacroResult(news_gate="clear", cot_bias="neutral")  # proxy: history unavailable
     records = []
 
-    for pair in PAIRS:
+    previous = _load_previous(pairs)
+    for pair in pairs:
+        # incremental save: a crash/timeout must not lose completed pairs
+        with open(RESULTS, "w") as fh:
+            json.dump(previous + records, fh)
         print(f"=== {pair}: loading {DAYS}d ...", flush=True)
         try:
             frames = load_frames(pair, days=DAYS, use_cache=True)
@@ -121,9 +138,10 @@ def main() -> None:
                 })
         print(f"  signals={n_signals} passed_htf={n_htf} scored={n_scored}", flush=True)
 
-    with open("/tmp/funnel_backtest.json", "w") as fh:
-        json.dump(records, fh)
-    print(f"DONE: {len(records)} setups recorded", flush=True)
+    with open(RESULTS, "w") as fh:
+        json.dump(previous + records, fh)
+    print(f"DONE: {len(records)} new setups recorded "
+          f"({len(previous)} kept from previous runs)", flush=True)
 
 
 if __name__ == "__main__":
