@@ -128,7 +128,11 @@ SELECTOR_MIN_SCORE = env_int("SELECTOR_MIN_SCORE", 70)
 SELECTOR_RETRAIN_TRADES = env_int("SELECTOR_RETRAIN_TRADES", 25)
 
 # ---- circuit breakers ----
-STALENESS_LIMIT_SEC = env_int("STALENESS_LIMIT_SEC", 180)
+# M15 candles close every 15 min; Yahoo/broker feeds legitimately lag several
+# minutes behind. A feed is "truly stale" only after 10 min without updates.
+STALENESS_LIMIT_SEC = env_int("STALENESS_LIMIT_SEC", 600)
+# Feed dead this long (continuously) = full HALT (before that: observation).
+FEED_DEAD_LIMIT_SEC = env_int("FEED_DEAD_LIMIT_SEC", 1800)
 VIX_HALT = env_float("VIX_HALT", 40.0)
 VIX_REDUCE_60 = env_float("VIX_REDUCE_60", 30.0)
 VIX_REDUCE_30 = env_float("VIX_REDUCE_30", 20.0)

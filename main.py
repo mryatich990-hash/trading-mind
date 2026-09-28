@@ -278,12 +278,14 @@ class TradingSystem:
             return False, f"broker error: {exc}"
 
     def _check_feeds(self) -> tuple[bool, str]:
-        """Check 4: verify every configured feed, trade only if one works.
+        """Check 4: verify every configured feed THROUGH the breaker system.
 
-        MT5 is probed directly (tick age); yfinance/TwelveData via a real
-        validated fetch. Fails ONLY when every configured feed is dead ->
-        bot refuses to start. One healthy feed (e.g. yfinance-only cloud)
-        passes with a summary of the per-feed results.
+        One system, one alert (merges the old duplicate startup + breaker
+        paths): the per-feed probe results are recorded via the circuit
+        breakers, and the engine state machine decides the outcome —
+        RUNNING if any feed works, OBSERVATION if only stale, HALT only
+        via the machine's 30-minute rule. Startup itself refuses to boot
+        solely when every configured feed is dead.
         """
         from data.market_data_engine import fx_market_closed, validate_ohlcv
 
@@ -292,7 +294,7 @@ class TradingSystem:
         results: dict[str, bool] = {}
         details: list[str] = []
 
-        # 1. MT5: fresh tick (< 120s old) proves the terminal + broker link.
+        # 1. MT5: fresh tick proves the terminal + broker link.
         mt5_feed = next((f for f in self.data.feeds if f.name == "mt5"), None)
         if mt5_feed is not None and mt5_feed.configured:
             age = mt5_feed.tick_age_sec(pair)
@@ -300,10 +302,7 @@ class TradingSystem:
             details.append(f"mt5={'OK' if results['mt5'] else 'DEAD'}"
                            + (f" (tick {age:.0f}s)" if age is not None else ""))
 
-        # 2. yfinance: a real validated candle fetch (respects TTL cache).
-        #    Same freshness rule as the engine's own validation
-        #    (max(STALENESS_LIMIT, timeframe*60*2)) — a mid-candle Yahoo delay
-        #    of several minutes is normal and must not fail startup.
+        # 2. yfinance: real validated fetch with the engine's freshness rule.
         yf_feed = next((f for f in self.data.feeds if f.name == "yfinance"), None)
         if yf_feed is not None:
             try:
@@ -328,12 +327,21 @@ class TradingSystem:
                 results["twelve_data"] = False
                 details.append(f"twelve_data=DEAD ({str(exc)[:60]})")
 
+        any_live = any(results.values())
         detail = f"{pair} " + ("; ".join(details) if details else "no feeds configured")
-        if results and any(results.values()):
-            if closed:
-                detail += " [weekend close: staleness expected]"
+
+        # --- single alert path: record the outcome through the breakers ---
+        if closed:
+            detail += " [weekend close: staleness expected]"
+        elif not any_live:
+            # single alert path: the machine's _observe() sends exactly ONE
+            # state-transition alert; this check adds no duplicate message
+            self.breakers._observe("startup: no feed produced valid candles")
+            detail += (" -> observation mode; AutoRecovery resumes when a "
+                       "feed recovers")
+        if any_live:
             return True, detail
-        return False, detail + " -> NO FEEDS AVAILABLE, refusing to start"
+        return False, detail
 
     def _check_groq(self) -> tuple[bool, str]:
         """Check 5: Groq reachable (warning-only when no key: research auto-accepts)."""
@@ -391,10 +399,21 @@ class TradingSystem:
             if enabled else (False, "all strategies disabled")
 
     def _check_breakers(self) -> tuple[bool, str]:
-        """Check 9: unresolved halt breakers block trading (not boot)."""
-        active = db.unresolved_breakers()
+        """Check 9: unresolved halt breakers block trading (not boot).
+
+        Observation-severity breakers (soft data_stale) do NOT fail this
+        check: observation mode suppresses new trades but is a running
+        posture, not a boot blocker.
+        """
+        # retire pre-state-machine halt rows first (one-time migration)
+        if self.breakers is not None:
+            self.breakers._retire_legacy_data_stale_halt()
+        active = db.unresolved_breakers("halt")
         if active:
-            return False, f"unresolved breakers: {', '.join(active)}"
+            return False, f"unresolved halts: {', '.join(active)}"
+        observing = db.unresolved_breakers("observe")
+        if observing:
+            return True, f"observation active: {', '.join(observing)} (not a halt)"
         return True, "no active halts"
 
     def _check_event_bus(self) -> tuple[bool, str]:
@@ -420,6 +439,9 @@ class TradingSystem:
         self._beat()
         session_ok = self.run_startup_checks()
         db.set_state("observation_mode", "0" if session_ok else "1")
+        # seed the state-machine keys so dashboards see the posture
+        if self.breakers is not None:
+            self.breakers._persist_state(self.breakers.get_engine_state())
 
         # AutoRecovery: background self-healing (feed watch, MT5 reconnect,
         # auto-resume when no breakers). Starts regardless of startup outcome:
@@ -435,13 +457,11 @@ class TradingSystem:
             if feed_only:
                 # Recovery path: AutoRecovery clears observation mode and
                 # resumes once any feed produces valid candles again.
+                # NO extra Telegram here: _check_feeds already emitted the
+                # single observation transition alert via the breaker system.
                 db.set_state("feed_boot_failure", "1")
                 db.audit("system", "observation_mode",
                          "feed-only startup failure; auto-recovery armed")
-                if self.notifier:
-                    self.notifier.send("⚠️ Startup checks failed (data feeds dead): "
-                                       "observation mode. AutoRecovery will resume "
-                                       "trading when a feed recovers.")
             else:
                 if self.notifier:
                     self.notifier.send("⚠️ Startup checks failed: entering observation "
@@ -500,6 +520,9 @@ class TradingSystem:
         """One M15 cycle over every pair: select -> research -> risk -> execute."""
         paused = db.get_state("trading_paused", "0") == "1"
         weekend_locked = "weekend" in db.unresolved_breakers()
+        # OBSERVATION (soft data_stale): no NEW trades; positions below are
+        # still managed every cycle by trade_manager (unchanged).
+        observation = self.breakers.get_engine_state() == "observation"
 
         # Remote close-all request (dashboard /api/close writes the state key;
         # the engine executes it here). Infra-only addition — no logic change.
@@ -525,10 +548,11 @@ class TradingSystem:
                 selection = await asyncio.to_thread(self.selector.run, ctx)
                 if selection.winner is None:
                     continue
-                if not trading_allowed or paused or weekend_locked:
-                    logger.info("signal %s %s suppressed (paused=%s allowed=%s weekend=%s)",
+                if not trading_allowed or paused or weekend_locked or observation:
+                    logger.info("signal %s %s suppressed (paused=%s allowed=%s "
+                                "weekend=%s observation=%s)",
                                 pair, selection.winner.direction, paused,
-                                trading_allowed, weekend_locked)
+                                trading_allowed, weekend_locked, observation)
                     continue
                 await self._process_signal(selection.winner)
             except Exception as exc:
@@ -583,6 +607,17 @@ class TradingSystem:
                 compute_hash(signal.pair, signal.direction, signal.strategy, signal.entry),
                 minutes=15):
             logger.info("duplicate signal skipped: %s %s", signal.pair, signal.strategy)
+            return
+
+        # OBSERVATION posture (soft data_stale): no new trades from ANY
+        # funnel — research cycle or TradingView webhook alike. Existing
+        # positions continue to be managed by TradeManager.
+        if self.breakers is not None \
+                and self.breakers.get_engine_state() == "observation":
+            logger.info("signal %s %s suppressed (observation mode)",
+                        signal.pair, signal.strategy)
+            db.record_research(signal.pair, "suppressed",
+                               "observation mode: feed unstable")
             return
 
         # step 9 filter: ML loss-probability (when trained)
@@ -719,9 +754,24 @@ class TradingSystem:
         except Exception:
             pass
 
+        # feed telemetry for the state machine (RUNNING/OBSERVATION/HALTED)
+        pair0 = settings.TRADING_PAIRS[0]
+        now_ts = time.time()
+        since_ok = 0.0
+        if self.data.last_success_time:
+            since_ok = now_ts - self.data.last_success_time
+        elif self.data.last_failure_time:
+            since_ok = now_ts - self.data.last_failure_time
+        stable_for = (now_ts - self.data.healthy_since) \
+            if self.data.healthy_since else 0.0
+
         state = self.breakers.evaluate(
             feed_age_sec=feed_age,
             mt5_ok=broker is not None or not (self.mt5 and self.mt5.available()),
+            mt5_tick_live=self.data.mt5_tick_live(pair0),
+            feed_stability=self.data.feed_stability(),
+            seconds_since_success=since_ok,
+            feed_stable_for_sec=stable_for,
             db_ok=True, groq_ok=groq_ok, vix=vix, margin_level=margin_level)
 
         db.set_state("heartbeat", db._utcnow().isoformat())
@@ -729,6 +779,8 @@ class TradingSystem:
             db.set_state("running", "0")
             logger.warning("health: halted by %s", state.halt_reasons)
         else:
+            # observation mode keeps running=1: positions are still managed,
+            # only NEW trades are suppressed (see _trading_cycle)
             db.set_state("running", "1")
 
     async def _close_all_trades(self) -> int:

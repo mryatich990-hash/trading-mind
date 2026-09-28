@@ -357,10 +357,54 @@ class MarketDataEngine:
         self.consecutive_failures = 0
         self.active_feed = "none"
         self.last_update: Optional[datetime] = None
+        # last-20-outcome window for the stability score (see feed_stability)
+        self._check_history: list[bool] = []
+        self.last_success_time: Optional[float] = None
+        self.last_failure_time: Optional[float] = None
+        # start of the current UNINTERRUPTED success streak (None = failing
+        # or never succeeded); drives the 5-minute stable-feed recovery rule
+        self.healthy_since: Optional[float] = None
         self._latencies: list[float] = []
         self._cache: dict[str, CandleData] = {}
 
     # ---- status (consumed by AutoRecovery + /health) ----
+
+    def feed_stability(self) -> float:
+        """Success rate (%) over the last 20 fetch attempts.
+
+        100.0 with no history. A single candle-gap failure barely moves the
+        score; a persistent outage drags it below 50% — that pattern, not a
+        single gap, is what justifies alerting/halting.
+        """
+        if not self._check_history:
+            return 100.0
+        return round(100.0 * sum(self._check_history) / len(self._check_history), 1)
+
+    def _record_check(self, ok: bool) -> None:
+        self._check_history.append(ok)
+        del self._check_history[:-20]
+        if ok:
+            self.last_success_time = time.time()
+            if self.healthy_since is None:
+                self.healthy_since = time.time()  # success streak begins
+        else:
+            self.last_failure_time = time.time()
+            self.healthy_since = None  # streak broken: stability clock resets
+
+    def mt5_tick_live(self, pair: str) -> bool:
+        """True when MT5 returns ANY tick for the pair (broker link proven).
+
+        A live MT5 terminal overrides staleness heuristics: quotes stream
+        every tick, so data_stale must never fire while this returns True.
+        """
+        for feed in self.feeds:
+            if feed.name == "mt5" and feed.configured:
+                try:
+                    feed._ensure()
+                    return feed.mt5.symbol_info_tick(pair.upper()) is not None
+                except Exception:
+                    return False
+        return False
 
     def get_feed_status(self) -> dict:
         """Current failover posture for monitoring/auto-recovery."""
@@ -368,6 +412,11 @@ class MarketDataEngine:
             "active_feed": self.active_feed,
             "last_update": self.last_update.isoformat() if self.last_update else None,
             "consecutive_failures": self.consecutive_failures,
+            "feed_stability": self.feed_stability(),
+            "last_success_time": self.last_success_time,
+            "last_failure_time": self.last_failure_time,
+            "feed_stable_for_sec": (time.time() - self.healthy_since)
+                                   if self.healthy_since is not None else 0.0,
             "feeds_configured": [f.name for f in self.feeds
                                  if getattr(f, "configured", True)],
             "mt5_connected": self._mt5_connected(),
@@ -408,6 +457,7 @@ class MarketDataEngine:
                     source=feed.name, fetch_seconds=round(latency, 3),
                 )
                 self.consecutive_failures = 0
+                self._record_check(True)
                 self._cache[f"{pair}_{timeframe_min}"] = candle
                 self._mark_feed_ok(feed.name, previous_source)
                 return candle
@@ -417,6 +467,7 @@ class MarketDataEngine:
                 if time.monotonic() >= deadline:
                     break
         self.consecutive_failures += 1
+        self._record_check(False)
         db.log_feed_health("data_feeds", False, "; ".join(errors)[:255])
         cached = self._cache.get(f"{pair}_{timeframe_min}")
         if cached is not None:

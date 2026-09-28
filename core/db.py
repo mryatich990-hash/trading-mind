@@ -169,15 +169,24 @@ def resolve_breakers() -> None:
         s.commit()
 
 
-def unresolved_breakers() -> list[str]:
-    """Names of active (unresolved) halt breakers."""
+def unresolved_breakers(severity: str = "halt") -> list[str]:
+    """Names of active (unresolved) breakers, default: halt-severity only.
+
+    severity="observe" returns observation-severity breakers (e.g. a soft
+    data_stale: no new trades, but existing positions keep being managed).
+    """
+    if severity not in ("halt", "observe", "all"):
+        severity = "halt"
     with _session() as s:
-        rows = s.execute(
-            text(_fix(
-                "SELECT DISTINCT breaker FROM circuit_breakers "
-                "WHERE resolved = FALSE AND severity = 'halt'"
-            ))
-        ).all()
+        if severity == "all":
+            sql = ("SELECT DISTINCT breaker FROM circuit_breakers "
+                   "WHERE resolved = FALSE")
+            params = {}
+        else:
+            sql = ("SELECT DISTINCT breaker FROM circuit_breakers "
+                   "WHERE resolved = FALSE AND severity = :sev")
+            params = {"sev": severity}
+        rows = s.execute(text(_fix(sql)), params).all()
         return [r[0] for r in rows]
 
 

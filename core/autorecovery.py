@@ -36,7 +36,7 @@ class AutoRecovery:
     RECONNECT_THROTTLE_SEC = 300  # MT5 re-init at most every 5 minutes
 
     def __init__(self, data_engine, breakers, notifier: Optional[callable] = None,
-                 interval_sec: int = 60) -> None:
+                 interval_sec: int = 30) -> None:
         self.data = data_engine
         self.breakers = breakers
         self.notifier = notifier
@@ -68,7 +68,12 @@ class AutoRecovery:
         self._check_auto_resume()
 
     def _check_feed_recovery(self) -> None:
-        """Resolve data_stale when the feed is producing fresh candles again."""
+        """Drive the feed state machine every 30 seconds.
+
+        All decisions (observation vs halt vs recovery) live in
+        CircuitBreakers.evaluate_feed_rules(); this loop supplies fresh
+        measurements and benefits from its idempotence.
+        """
         try:
             status = self.data.get_feed_status()
         except Exception as exc:
@@ -93,23 +98,44 @@ class AutoRecovery:
                 logger.warning("recovery: data feed failing")
             self._last_feed_ok = feed_ok
 
-        if not feed_ok:
-            return
+        # ---- feed the state machine with fresh measurements ----
         try:
-            stale_active = self.breakers.is_active("data_stale") \
-                or "data_stale" in db.unresolved_breakers()
-            if stale_active:
-                self.breakers.resolve("data_stale")
-                db.audit("data", "auto_recovery",
-                         "data_stale resolved: feed recovered")
-                logger.info("recovery: data_stale cleared, feed is back")
+            last_ok = status.get("last_success_time")
+            last_bad = status.get("last_failure_time")
+            now = time.time()
+            if last_ok:
+                seconds_since_success = now - last_ok
+            elif last_bad:
+                # never succeeded since process start: use the failure record
+                # (lower bound; the 30-min halt rule still applies eventually)
+                seconds_since_success = now - last_bad
+            else:
+                seconds_since_success = None  # no signal yet: skip
+
+            if seconds_since_success is not None:
+                stable_for = status.get("feed_stable_for_sec", 0.0) or 0.0
+                feed_age = 0.0 if stable_for > 0 else seconds_since_success
+                pair = "EURUSD"
+                try:
+                    from config import settings as _settings
+                    pair = _settings.TRADING_PAIRS[0]
+                except Exception:
+                    pass
+                self.breakers.evaluate_feed_rules(
+                    feed_age_sec=feed_age,
+                    mt5_tick_live=self.data.mt5_tick_live(pair),
+                    feed_stability=status.get("feed_stability", 100.0),
+                    seconds_since_success=seconds_since_success,
+                    feed_stable_for_sec=stable_for,
+                )
         except Exception as exc:
-            logger.error("data_stale recovery failed: %s", exc)
+            logger.error("feed state machine update failed: %s", exc)
 
         # Boot-heal: the process started with every feed dead (observation
         # mode); a feed now works, so re-enable trading.
         try:
-            if db.get_state("feed_boot_failure", "0") == "1":
+            if feed_ok and db.get_state("feed_boot_failure", "0") == "1" \
+                    and self.breakers.get_engine_state() == "running":
                 db.set_state("feed_boot_failure", "0")
                 db.set_state("observation_mode", "0")
                 db.set_state("running", "1")
@@ -143,7 +169,12 @@ class AutoRecovery:
             logger.error("MT5 reconnect check failed: %s", exc)
 
     def _check_auto_resume(self) -> None:
-        """Lift a halt when no breaker is active and the market is open."""
+        """Lift a legacy halt when no breaker is active and the market is open.
+
+        Feed-driven states (observation/halted via data_stale/feed_dead) are
+        owned by the breaker state machine; this only catches a 'running=0'
+        with genuinely no active breakers (e.g. leftovers from older versions).
+        """
         from data.market_data_engine import fx_market_closed
 
         if fx_market_closed():
@@ -155,7 +186,7 @@ class AutoRecovery:
 
         try:
             if self.breakers.has_active_breakers():
-                return  # still halted for a reason
+                return  # still halted for a reason (machine handles feed states)
         except Exception as exc:
             logger.error("breaker check failed during auto-resume: %s", exc)
             return
