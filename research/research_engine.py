@@ -182,7 +182,7 @@ class ResearchEngine:
 
     def evaluate(self, pair: str, direction: str, strategy: str,
                  signal_entry: float, signal_sl: float, signal_tp: float,
-                 session: str = "") -> ResearchVerdict:
+                 session: str = "", _mirrored: bool = False) -> ResearchVerdict:
         """Run all 10 steps. Returns an approved verdict or a logged rejection."""
         started = time.monotonic()
         verdict = ResearchVerdict(pair=pair, direction=direction, strategy=strategy,
@@ -210,6 +210,19 @@ class ResearchEngine:
             if not htf.direction_ok:
                 reason = (f"step3 HTF disagree: daily={htf.daily_trend} h4={htf.h4_bias} "
                           f"want={direction}")
+                # When BOTH timeframes agree on one direction, the setup is
+                # valid but was proposed the wrong way round (e.g. a mean-
+                # reversion short into a daily uptrend). Retrying the mirror
+                # direction salvages the cycle instead of wasting it. When the
+                # timeframes CONFLICT (daily=up h4=bearish) both directions are
+                # blocked by design — no retry (logs confirm retrying those
+                # only produces confluence-denials). The _mirrored flag is a
+                # recursion guard: a mirrored evaluation never mirrors again.
+                mirrored = (None if _mirrored else self._mirror_retry(
+                    pair, direction, strategy, signal_entry, signal_sl,
+                    signal_tp, session, htf))
+                if mirrored is not None:
+                    return mirrored
                 verdict.reason = reason
                 db.record_research(pair, "rejected", reason)
                 return self._finish(verdict, started)
@@ -286,6 +299,43 @@ class ResearchEngine:
             verdict.reason = f"research error: {exc}"
             db.record_research(pair, "rejected", verdict.reason[:200])
             return self._finish(verdict, started)
+
+    # ---- step3 mirror retry -------------------------------------------------
+
+    def _mirror_retry(self, pair: str, direction: str, strategy: str,
+                      signal_entry: float, signal_sl: float, signal_tp: float,
+                      session: str, htf) -> Optional["ResearchVerdict"]:
+        """Re-evaluate the SAME setup in the opposite direction.
+
+        Used when step3 rejects only because the proposed direction fights an
+        otherwise-agreed higher-timeframe trend (daily=h4=up but want=sell).
+        All downstream checks (zones, RSI, MACD, Groq) are direction-symmetric,
+        so the flipped setup gets a full fair evaluation — nothing is forced
+        through. Returns None when HTFs conflict (mirror blocked by design)
+        or when the mirrored evaluation is itself rejected.
+        """
+        if not htf.htf_agree:
+            return None
+        flipped = "buy" if direction == "sell" else "sell"
+        try:
+            # no macro pre-check here: evaluate() enforces the news gate
+            # itself at step2, so a blocked mirror is rejected normally
+            m_entry, m_sl, m_tp = self._mirror_prices(
+                signal_entry, signal_sl, signal_tp, flipped)
+            return self.evaluate(pair, flipped, strategy, m_entry, m_sl, m_tp,
+                                 session, _mirrored=True)
+        except Exception as exc:
+            logger.debug("mirror retry failed for %s: %s", pair, exc)
+            return None
+
+    @staticmethod
+    def _mirror_prices(entry: float, sl: float, tp: float,
+                       direction: str) -> tuple[float, float, float]:
+        """Reflect SL/TP to the other side of entry (symmetric involution:
+        mirroring twice returns the original levels). Entry unchanged."""
+        if entry <= 0 or sl <= 0 or tp <= 0:
+            return entry, sl, tp
+        return entry, 2 * entry - sl, 2 * entry - tp
 
     def _groq_consensus(self, pair: str, prompt: str) -> Optional[dict]:
         """Ask Groq 3x at temperature 0; majority rules, any skip wins."""

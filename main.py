@@ -749,7 +749,8 @@ class TradingSystem:
         vix = 0.0
         margin_level = 1000.0
         try:
-            candle = self.data.get_candles(settings.TRADING_PAIRS[0], 15, 5)
+            candle = self.data.get_candles(settings.TRADING_PAIRS[0], 15, 5,
+                                           probe=True)
             last_ts = candle.df["time"].iloc[-1]
             import pandas as pd
             from datetime import datetime, timezone

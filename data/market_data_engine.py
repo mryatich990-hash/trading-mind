@@ -332,6 +332,7 @@ class CandleData:
     bid: float = 0.0
     ask: float = 0.0
     fetch_seconds: float = 0.0
+    fetched_at: float = 0.0  # time.monotonic() stamp for cache TTL checks
 
     @property
     def last_close(self) -> float:
@@ -344,6 +345,13 @@ class CandleData:
         if self.ask <= 0 or self.bid <= 0:
             return 0.0
         return round((self.ask - self.bid) / pip_size(self.pair), 1)
+
+
+# Per-timeframe cache TTLs. Daily/H4 candles barely change minute-to-minute;
+# refetching the whole 5-timeframe bundle every research cycle (~1 request
+# per pair per TF, ~40/min across 8 pairs) is what trips Yahoo's throttling
+# and produced 37,979 feed failures in one day. m15/m1 stay short.
+_CACHE_TTL_BY_TF = {1: 60.0, 15: 90.0, 60: 300.0, 240: 900.0, 1440: 3600.0}
 
 
 class MarketDataEngine:
@@ -438,8 +446,14 @@ class MarketDataEngine:
 
     # ---- fetching with failover ----
 
-    def get_candles(self, pair: str, timeframe_min: int = 15, count: int = 300) -> CandleData:
-        """Fetch validated candles with feed failover inside the deadline."""
+    def get_candles(self, pair: str, timeframe_min: int = 15, count: int = 300,
+                    probe: bool = False) -> CandleData:
+        """Fetch validated candles with feed failover inside the deadline.
+
+        probe=True skips the result cache entirely: health/breaker probes must
+        exercise the live feed so a real outage is never masked by cached
+        candles (cached fallback on total failure is still allowed).
+        """
         deadline = time.monotonic() + self.failover_deadline_sec
         errors: list[str] = []
         # Yahoo streams 1m/5m FUTURES candles with a ~10-minute delay; a
@@ -452,6 +466,14 @@ class MarketDataEngine:
         else:
             freshness = max(settings.STALENESS_LIMIT_SEC, timeframe_min * 60 * 2)
         previous_source = self.active_feed
+        if not probe:
+            # key includes count: callers requesting different row counts must
+            # never read each other's cached bundles
+            cached = self._cache.get(f"{pair}_{timeframe_min}_{count}")
+            if cached is not None and \
+                    time.monotonic() - cached.fetched_at <= _CACHE_TTL_BY_TF.get(
+                        timeframe_min, 90.0):
+                return cached
         for attempt in range(len(self.feeds)):
             feed = self.feeds[attempt % len(self.feeds)]
             if not getattr(feed, "configured", True):
@@ -461,6 +483,30 @@ class MarketDataEngine:
                 df = feed.fetch(pair, timeframe_min, count)
                 err = validate_ohlcv(df, pair, freshness, timeframe_min)
                 if err:
+                    # 1m special case: Yahoo FX spot 1m candles legitimately go
+                    # flat during quiet hours and futures 1m lags ~10 min, so
+                    # freeze-detection here starved strategies of m1 data
+                    # entirely. Fallback: resample the validated 15m batch.
+                    if timeframe_min == 1 and err == "data freeze detected" \
+                            and pair.upper() != "XAUUSD":
+                        m15 = None if probe else self._cache.get(f"{pair}_15_300")
+                        if m15 is None:
+                            try:
+                                m15 = self.get_candles(pair, 15, 300, probe=True)
+                            except Exception:
+                                m15 = None
+                        if m15 is not None:
+                            df = self._resample_to_1m(m15.df)
+                            if df is not None:
+                                logger.info("1m freeze on %s: serving resampled 15m fallback",
+                                            pair)
+                                candle = CandleData(
+                                    pair=pair.upper(), timeframe_min=1, df=df,
+                                    source=f"{feed.name}+resample",
+                                    fetch_seconds=round(time.monotonic() - started, 3),
+                                )
+                                self._record_check(True)
+                                return candle
                     raise FeedError(err)
                 latency = time.monotonic() - started
                 self._record_latency(latency)
@@ -470,7 +516,8 @@ class MarketDataEngine:
                 )
                 self.consecutive_failures = 0
                 self._record_check(True)
-                self._cache[f"{pair}_{timeframe_min}"] = candle
+                candle.fetched_at = started
+                self._cache[f"{pair}_{timeframe_min}_{count}"] = candle
                 self._mark_feed_ok(feed.name, previous_source)
                 return candle
             except Exception as exc:
@@ -481,7 +528,7 @@ class MarketDataEngine:
         self.consecutive_failures += 1
         self._record_check(False)
         db.log_feed_health("data_feeds", False, "; ".join(errors)[:255])
-        cached = self._cache.get(f"{pair}_{timeframe_min}")
+        cached = self._cache.get(f"{pair}_{timeframe_min}_{count}")
         if cached is not None:
             return cached
         raise FeedError(f"all feeds failed for {pair}: {errors}")
@@ -516,6 +563,25 @@ class MarketDataEngine:
         last = float(candle.last_close)
         return {"bid": round(last - spread / 2, 6), "ask": round(last + spread / 2, 6),
                 "spread_pips": 1.0}
+
+    @staticmethod
+    def _resample_to_1m(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+        """Upsample a validated 15m frame to synthetic 1m candles.
+
+        Strategy m1 consumers only need recent intra-bar structure (stall
+        detection, micro-timing), so forward-filling each 15m candle into
+        flat 1m bars is sufficient and clearly labelled via the feed source.
+        Returns None when the input is unusable.
+        """
+        try:
+            if df is None or df.empty or len(df) < 3:
+                return None
+            work = df[["time", "open", "high", "low", "close", "volume"]].copy()
+            work = work.set_index("time").resample("1min").ffill().dropna()
+            out = work.reset_index()
+            return out if not out.empty else None
+        except Exception:
+            return None
 
     def get_frames(self, pair: str) -> dict[str, pd.DataFrame]:
         """Fetch the standard timeframe bundle used by the research engine."""
