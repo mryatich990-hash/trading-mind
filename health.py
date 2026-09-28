@@ -51,6 +51,30 @@ def _engine_alive() -> bool:
         return False
 
 
+def _child_beat() -> str:
+    """Child-liveness beat (/tmp/child.beat, written by main.py each cycle).
+
+    The supervisor writes engine_heartbeat itself, so a HUNG child used to
+    still report "alive" (2026-09-28 incident). The child now touches its
+    own beat file; /health requires BOTH to be fresh.
+    """
+    try:
+        p = Path("/tmp/child.beat")
+        if not p.exists():
+            return "no-file"
+        age = time.time() - float(p.read_text().strip())
+        return f"fresh({int(age)}s)" if age < 420 else f"stale({int(age)}s)"
+    except Exception as exc:
+        return f"err:{exc}"[:60]
+
+
+def _engine_really_alive() -> bool:
+    """True only when supervisor beat AND child beat are both fresh."""
+    sup = _supervisor_alive()
+    child = _child_beat()
+    return sup.startswith("fresh") and child.startswith("fresh")
+
+
 def _supervisor_alive() -> str:
     """File-based supervisor heartbeat (/tmp/engine.beat, written every 30s)."""
     try:
@@ -97,12 +121,14 @@ def health():
         db_status = "down"
         db_detail = f"{type(exc).__name__}: {exc}"[:300]
 
+    child_beat = _child_beat()
     return jsonify({
         "status": "running",
         "database": db_status,
         "database_error": db_detail,
-        "engine": "alive" if _engine_alive() else "starting",
+        "engine": "alive" if _engine_really_alive() else "starting",
         "supervisor": _supervisor_alive(),
+        "child_beat": child_beat,
         "child_log": _child_log_tail(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
@@ -121,7 +147,7 @@ def status():
             "daily_pnl": db.daily_pnl(),
             "halted_by": db.unresolved_breakers(),
             "paused": db.get_state("trading_paused", "0") == "1",
-            "engine": "alive" if _engine_alive() else "starting",
+            "engine": "alive" if _engine_really_alive() else "starting",
         })
     except Exception as exc:
         payload["error"] = str(exc)

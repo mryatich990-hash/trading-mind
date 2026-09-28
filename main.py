@@ -55,6 +55,7 @@ class TradingSystem:
         self.email_bridge: Optional[Any] = None
         self.autorecovery: Optional[Any] = None
         self._recovery_task: Optional[Any] = None
+        self._last_beat = 0.0
         self.shutdown = GracefulShutdown(bus)
         self._cycle_lock = asyncio.Lock()
         self._last_manage = 0.0
@@ -151,6 +152,24 @@ class TradingSystem:
         except Exception:
             pass
         return None
+
+    def _beat(self) -> None:
+        """Liveness touch for the cloud supervisor (deploy/run_engine.py).
+
+        The supervisor force-restarts this process when /tmp/child.beat goes
+        stale (>7 min) — the hang-detection fix for the 2026-09-28 incident
+        where a wedged child looked alive because the supervisor kept
+        writing its own heartbeat. Throttled to one write per 30s.
+        """
+        now = time.time()
+        if now - self._last_beat < 30:
+            return
+        self._last_beat = now
+        try:
+            with open("/tmp/child.beat", "w") as fh:
+                fh.write(str(now))
+        except Exception:
+            pass  # local/dev or read-only /tmp: supervisor check simply no-ops
 
     # ================================================================
     # startup checklist (10 checks)
@@ -282,11 +301,15 @@ class TradingSystem:
                            + (f" (tick {age:.0f}s)" if age is not None else ""))
 
         # 2. yfinance: a real validated candle fetch (respects TTL cache).
+        #    Same freshness rule as the engine's own validation
+        #    (max(STALENESS_LIMIT, timeframe*60*2)) — a mid-candle Yahoo delay
+        #    of several minutes is normal and must not fail startup.
         yf_feed = next((f for f in self.data.feeds if f.name == "yfinance"), None)
         if yf_feed is not None:
             try:
                 candle = yf_feed.fetch(pair, 15, 60)
-                err = validate_ohlcv(candle, pair, settings.STALENESS_LIMIT_SEC)
+                freshness = max(settings.STALENESS_LIMIT_SEC, 15 * 60 * 2)
+                err = validate_ohlcv(candle, pair, freshness)
                 results["yfinance"] = err is None
                 details.append(f"yfinance={'OK' if results['yfinance'] else 'BAD'}"
                                + (f" ({err})" if err else " (60 rows)"))
@@ -394,6 +417,7 @@ class TradingSystem:
         if self.notifier:
             self.notifier.start_polling()
 
+        self._beat()
         session_ok = self.run_startup_checks()
         db.set_state("observation_mode", "0" if session_ok else "1")
 
@@ -467,6 +491,7 @@ class TradingSystem:
         for _ in range(settings.CYCLE_INTERVAL_SEC * 10):
             if self.shutdown.shutting_down:
                 return
+            self._beat()
             await asyncio.sleep(0.1)
 
     # ---- trading cycle ----
@@ -490,6 +515,7 @@ class TradingSystem:
         for pair in settings.TRADING_PAIRS:
             if self.shutdown.shutting_down:
                 return
+            self._beat()
             try:
                 new_candle = await asyncio.to_thread(self._m15_candle_closed, pair)
                 if not new_candle:

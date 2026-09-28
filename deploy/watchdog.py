@@ -9,6 +9,7 @@ Runs on the LOCAL PC (systemd user service trading-watchdog.service) and:
 Secrets come from the local .env (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).
 """
 
+import email.utils
 import os
 import time
 from datetime import datetime, timezone
@@ -71,6 +72,27 @@ def telegram(text: str) -> None:
         log(f"telegram failed: {exc}")
 
 
+def _body_age_sec(resp) -> float:
+    """Age of a JSON health body vs the SERVER's own Date header.
+
+    Render/Cloudflare can keep serving 200s from a wedged instance (the
+    2026-09-28 incident: child frozen at 04:44, 200s all afternoon while
+    the engine did nothing). Comparing the body's own timestamp against
+    the server Date header exposes that: a large positive age means the
+    body is old even though the response is HTTP 200.
+    """
+    try:
+        server = email.utils.parsedate_to_datetime(resp.headers.get("Date", ""))
+        if server.tzinfo is None:
+            server = server.replace(tzinfo=timezone.utc)
+        body_ts = datetime.fromisoformat(resp.json().get("timestamp"))
+        if body_ts.tzinfo is None:
+            body_ts = body_ts.replace(tzinfo=timezone.utc)
+        return (server - body_ts).total_seconds()
+    except Exception:
+        return 0.0
+
+
 def main() -> None:
     state = load_state()
     fails = 0
@@ -99,13 +121,20 @@ def main() -> None:
             last_status = now
             status, health = {}, {}
             ok = True
+            stale_body = False
             try:
-                status = requests.get(RENDER_STATUS, timeout=25).json()
+                hr = requests.get(RENDER_HEALTH, timeout=25)
+                health = hr.json()
+                body_age = _body_age_sec(hr)
+                if body_age > 120:
+                    stale_body = True
+                    log(f"STALE health body: age {body_age:.0f}s (server clock) "
+                        f"- instance likely wedged")
             except Exception as exc:
                 ok = False
                 log(f"status unreachable: {str(exc)[:80]}")
             try:
-                health = requests.get(RENDER_HEALTH, timeout=25).json()
+                status = requests.get(RENDER_STATUS, timeout=25).json()
             except Exception:
                 pass
 
@@ -113,16 +142,25 @@ def main() -> None:
             db_ok = health.get("database") == "connected"
             halted = "weekend" in (status.get("halted_by") or [])
 
-            # --- failure alerting ---
-            if not ok or not engine_alive or not db_ok:
+            # --- failure alerting (includes stale/cached-body detection) ---
+            if not ok or stale_body or not engine_alive or not db_ok:
                 fails += 1
                 if fails == FAIL_THRESHOLD:
-                    telegram(
-                        f"🔴 <b>Cloud engine problem</b>\n"
-                        f"engine: {health.get('engine', '?')} | db: {health.get('database', '?')}\n"
-                        f"consecutive fails: {fails}\n"
-                        f"Supervisor auto-restarts it; check {RENDER_HEALTH}"
-                    )
+                    if stale_body or not ok:
+                        telegram(
+                            f"🔴 <b>Cloud serving stale data</b>\n"
+                            f"health endpoint frozen (instance wedged or cold).\n"
+                            f"Restart needed: Render Dashboard -> trading-bot "
+                            f"-> Manual Restart\nconsecutive fails: {fails}"
+                        )
+                    else:
+                        telegram(
+                            f"🔴 <b>Cloud engine problem</b>\n"
+                            f"engine: {health.get('engine', '?')} | "
+                            f"db: {health.get('database', '?')}\n"
+                            f"consecutive fails: {fails}\n"
+                            f"Supervisor auto-restarts it; check {RENDER_HEALTH}"
+                        )
             else:
                 if fails >= FAIL_THRESHOLD:
                     telegram("🟢 <b>Cloud engine recovered</b> — all checks green again.")
