@@ -4,10 +4,17 @@ Hard breakers halt trading immediately and persist as unresolved rows in
 circuit_breakers. Soft breakers restrict (size cuts, extra confluence) while
 the bot continues. Auto-resumable breakers clear themselves when the
 underlying condition disappears; critical ones require /resume.
+
+Alert escalation (anti-spam): a trigger alerts ONCE immediately, then only at
+1h/3h/6h/12h/24h of continuous activity — at most 6 alerts in the first 24
+hours, afterwards at most one per day. resolve() sends a single confirmation.
+The schedule survives restarts via the system_state table, so a daemon bounce
+cannot re-spam identical alerts.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import dataclass, field
@@ -28,6 +35,13 @@ AUTO_RESUME = {"data_stale", "mt5_disconnected", "groq_down", "atr_explosion",
                "vix_halt", "weekend", "weekend_pre"}
 CRITICAL = {"daily_loss", "drawdown_halt", "margin_halt", "groq_rejections"}
 
+# Alert schedule (hours of continuous activity before the next alert).
+# IMMEDIATE (first trigger) + 1h + 3h + 6h + 12h + 24h = 6 alerts max in 24h.
+# After 24h: one alert per day maximum.
+ESCALATION_HOURS = [1.0, 3.0, 6.0, 12.0, 24.0]
+
+_STATE_KEY = "breaker_alert_state"
+
 
 @dataclass
 class BreakerState:
@@ -46,7 +60,33 @@ class CircuitBreakers:
     def __init__(self, notifier: Optional[callable] = None) -> None:
         self.notifier = notifier
         self._lock = threading.Lock()
-        self._last_trigger: dict[str, float] = {}
+        # name -> {"first_trigger": epoch, "last_alert": epoch,
+        #          "alert_count": int, "resolved": bool, "reason": str}
+        self.active_breakers: dict[str, dict] = self._load_state()
+
+    # ---- alert persistence (survives restarts, no re-spam) ----
+
+    def _load_state(self) -> dict[str, dict]:
+        raw = ""
+        try:
+            raw = db.get_state(_STATE_KEY, "")
+        except Exception as exc:  # db may not be initialised in unit tests
+            logger.debug("breaker state load skipped: %s", exc)
+        if not raw:
+            return {}
+        try:
+            return {k: v for k, v in json.loads(raw).items()
+                    if isinstance(v, dict)}
+        except Exception:
+            return {}
+
+    def _save_state(self) -> None:
+        try:
+            db.set_state(_STATE_KEY, json.dumps(self.active_breakers, default=str))
+        except Exception as exc:
+            logger.debug("breaker state save skipped: %s", exc)
+
+    # ---- notifications ----
 
     def _notify(self, text: str) -> None:
         """Best-effort Telegram alert."""
@@ -56,19 +96,75 @@ class CircuitBreakers:
             except Exception as exc:  # pragma: no cover
                 logger.error("breaker notify failed: %s", exc)
 
-    # ---- triggering ----
+    # ---- triggering with escalation ----
 
     def trigger(self, breaker: str, reason: str, severity: str = "halt",
                 cooldown_sec: int = 300) -> bool:
-        """Activate a breaker (deduplicated by cooldown). True when new."""
+        """Activate/refresh a breaker; alert per the escalation schedule.
+
+        Returns True only when the breaker newly fired or the schedule emitted
+        an escalation alert (never on silent re-evaluations).
+        """
+        now = time.time()
+        new_fire = False
         with self._lock:
-            last = self._last_trigger.get(breaker, 0.0)
-            if time.monotonic() - last < cooldown_sec:
-                return False
-            self._last_trigger[breaker] = time.monotonic()
-        db.log_breaker(breaker, reason, severity)
-        self._notify(f"🚨 BREAKER [{severity}] {breaker}: {reason}")
-        return True
+            entry = self.active_breakers.get(breaker)
+
+            if entry is None or entry.get("resolved"):
+                # First time firing (or re-fired after resolution).
+                self.active_breakers[breaker] = {
+                    "first_trigger": now,
+                    "last_alert": now,
+                    "alert_count": 1,
+                    "resolved": False,
+                    "reason": reason[:200],
+                }
+                self._save_state()
+                new_fire = True
+                alerted = True
+                message = (f"🚨 CIRCUIT BREAKER [{severity}] {breaker}: {reason}\n"
+                           f"Bot halted. Next alert only if unresolved for 1h.")
+            else:
+                # Already active: escalation schedule, otherwise stay silent.
+                entry["reason"] = reason[:200]
+                hours_active = (now - entry["first_trigger"]) / 3600.0
+                count = entry["alert_count"]
+                alerted = False
+                message = ""
+                if count <= len(ESCALATION_HOURS):
+                    threshold = ESCALATION_HOURS[count - 1]
+                    if hours_active >= threshold:
+                        entry["alert_count"] = count + 1
+                        entry["last_alert"] = now
+                        self._save_state()
+                        alerted = True
+                        if count < len(ESCALATION_HOURS):
+                            message = (f"⚠️ BREAKER STILL ACTIVE [{severity}] "
+                                       f"{breaker}: {reason}\n"
+                                       f"Active for {threshold:.0f}h. "
+                                       f"Manual check recommended.")
+                        else:
+                            # 24h reached: 6th alert inside 24h.
+                            message = (f"⚠️ BREAKER STILL ACTIVE [{severity}] "
+                                       f"{breaker}: {reason}\n"
+                                       f"Active for over 24h. Will alert at most "
+                                       f"once per day until resolved.")
+                else:
+                    # Beyond the schedule: at most ONE alert per day.
+                    if now - entry["last_alert"] >= 86400.0:
+                        entry["alert_count"] = count + 1
+                        entry["last_alert"] = now
+                        self._save_state()
+                        alerted = True
+                        message = (f"⚠️ BREAKER STILL ACTIVE [{severity}] "
+                                   f"{breaker}: {reason}\n"
+                                   f"Active for {hours_active / 24:.0f} days.")
+
+        if new_fire:
+            db.log_breaker(breaker, reason, severity)  # halt state lives here
+        if alerted:
+            self._notify(message)
+        return alerted
 
     def resolve(self, breaker: str) -> None:
         """Clear a specific breaker when its condition is gone."""
@@ -80,13 +176,45 @@ class CircuitBreakers:
                 "UPDATE circuit_breakers SET resolved = TRUE, resolved_at = :t "
                 "WHERE breaker = :b AND resolved = FALSE"
             ), {"t": db._utcnow(), "b": breaker})
-        self._notify(f"✅ breaker cleared: {breaker}")
+
+        with self._lock:
+            entry = self.active_breakers.get(breaker)
+            was_alerting = entry is not None and not entry.get("resolved")
+            duration_min = 0.0
+            if entry is not None:
+                duration_min = max(0.0, (time.time() - entry["first_trigger"]) / 60.0)
+                entry["resolved"] = True
+                self._save_state()
+
+        # Exactly ONE confirmation, only when the breaker had actually alerted.
+        if was_alerting:
+            self._notify(f"✅ BREAKER RESOLVED: {breaker} recovered after "
+                         f"{duration_min:.0f} minutes. Bot resuming trading.")
 
     def resume_all(self) -> None:
         """Manual /resume: clear every unresolved breaker."""
         db.resolve_breakers()
+        for name in list(self.active_breakers):
+            self.resolve(name)
         db.audit("risk", "manual_resume", "all breakers cleared via /resume")
         self._notify("▶️ Trading resumed manually. All breakers cleared.")
+
+    # ---- queries (used by AutoRecovery) ----
+
+    def is_active(self, breaker: str) -> bool:
+        """True when the breaker has an unresolved, alerting entry."""
+        with self._lock:
+            entry = self.active_breakers.get(breaker)
+            return entry is not None and not entry.get("resolved", False)
+
+    def has_active_breakers(self) -> bool:
+        """True when any halt-severity breaker is unresolved in the DB."""
+        if any(not v.get("resolved", False) for v in self.active_breakers.values()):
+            return True
+        try:
+            return bool(db.unresolved_breakers())
+        except Exception:
+            return False
 
     # ---- periodic evaluation ----
 

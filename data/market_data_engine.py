@@ -1,13 +1,22 @@
-"""Unified market data engine (consolidates prompt 2's validated feeds).
+"""Unified market data engine: MT5 -> yfinance -> Twelve Data failover.
 
-Adds: consensus price check, data-freeze detection, candle anomaly detection
-(5x ATR body/wick), latency monitoring with alerting, and raw OHLCV storage.
+Feed chain (primary first):
+  1. MT5 terminal feed  - free, unlimited, broker-direct (guarded import;
+     skipped automatically on hosts without the MetaTrader5 package, e.g.
+     Linux/Render).
+  2. YFinance feed      - free, no API key, no hard rate limit (TTL-cached).
+  3. Twelve Data        - key-limited (800/day free), used only as a last
+     resort for confirmation.
+
+Alpha Vantage has been REMOVED entirely (25 req/day free tier killed the
+feed for 54+ hours). Every candle batch is validated (freshness, OHLC logic,
+volume, freeze, anomalies) before use; feed switches are audited and the
+current feed status is exposed via get_feed_status() for AutoRecovery.
 """
 
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 from typing import Optional
 
 import numpy as np
@@ -20,11 +29,9 @@ from core.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["FeedError", "CandleData", "MarketDataEngine", "validate_ohlcv", "pip_size"]
+__all__ = ["FeedError", "CandleData", "MarketDataEngine", "validate_ohlcv",
+           "pip_size", "fx_market_closed"]
 
-AV_SYMBOLS = {"EURUSD": "C:EURUSD", "GBPUSD": "C:GBPUSD", "XAUUSD": "C:XAUUSD",
-              "USDJPY": "C:USDJPY", "GBPJPY": "C:GBPJPY", "EURJPY": "C:EURJPY",
-              "USDCHF": "C:USDCHF", "AUDUSD": "C:AUDUSD"}
 TD_SYMBOLS = {"EURUSD": "EUR/USD", "GBPUSD": "GBP/USD", "XAUUSD": "XAU/USD",
               "USDJPY": "USD/JPY", "GBPJPY": "GBP/JPY", "EURJPY": "EUR/JPY",
               "USDCHF": "USD/CHF", "AUDUSD": "AUD/USD"}
@@ -92,55 +99,92 @@ def validate_ohlcv(df: pd.DataFrame, pair: str, max_age_sec: float) -> Optional[
     return None
 
 
-class AlphaVantageFeed:
-    """Primary feed: Alpha Vantage FX_INTRADAY."""
+class MT5Feed:
+    """PRIMARY feed: MetaTrader 5 terminal (broker-direct, unlimited).
 
-    name = "alpha_vantage"
+    Guarded import: when the MetaTrader5 package is not installed (Linux,
+    Render cloud), ``configured`` is False and the feed is skipped silently.
+    """
+
+    name = "mt5"
 
     @property
     def configured(self) -> bool:
-        """False when no API key is set (skip instantly, no warning spam)."""
-        return bool(settings.ALPHA_VANTAGE_API_KEY)
+        """False when the MetaTrader5 package is unavailable on this OS."""
+        try:
+            import MetaTrader5  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
     def __init__(self) -> None:
-        self.session = requests.Session()
-        self.last_call = 0.0
+        self.mt5 = None
+        self._connected = False
+
+    def _ensure(self) -> bool:
+        """Initialize/login MT5 once (and re-initialize after a drop)."""
+        if self._connected:
+            return True
+        try:
+            import MetaTrader5 as mt5  # type: ignore
+        except ImportError as exc:
+            raise FeedError("MetaTrader5 unavailable") from exc
+        kwargs = {"server": settings.MT5_SERVER} if settings.MT5_SERVER else {}
+        if not mt5.initialize(**kwargs):
+            raise FeedError(f"initialize failed: {mt5.last_error()}")
+        if settings.MT5_LOGIN:
+            if not mt5.login(int(settings.MT5_LOGIN), password=settings.MT5_PASSWORD,
+                             server=settings.MT5_SERVER):
+                raise FeedError(f"login failed: {mt5.last_error()}")
+        self.mt5 = mt5
+        self._connected = True
+        return True
+
+    def reconnect(self) -> bool:
+        """Force a terminal re-initialization (AutoRecovery path)."""
+        self._connected = False
+        self.mt5 = None
+        try:
+            return self._ensure()
+        except Exception:
+            return False
+
+    def connected(self) -> bool:
+        """True when the terminal responds (AutoRecovery/health path)."""
+        try:
+            self._ensure()
+            return self.mt5.terminal_info() is not None
+        except Exception:
+            return False
+
+    def tick_age_sec(self, pair: str) -> Optional[float]:
+        """Age of the last tick in seconds; None when unavailable."""
+        try:
+            self._ensure()
+            tick = self.mt5.symbol_info_tick(pair.upper())
+            if tick is None or not tick.time:
+                return None
+            return max(0.0, time.time() - tick.time)
+        except Exception:
+            return None
+
     def fetch(self, pair: str, timeframe_min: int, count: int) -> pd.DataFrame:
-        """Fetch OHLCV rows."""
-        if not settings.ALPHA_VANTAGE_API_KEY:
-            raise FeedError("no API key")
-        if timeframe_min not in (1, 5, 15, 30, 60):
-            raise FeedError(f"unsupported interval {timeframe_min}m")
-        symbol = AV_SYMBOLS.get(pair.upper())
-        if not symbol:
-            raise FeedError(f"no mapping for {pair}")
-        wait = 12.0 - (time.monotonic() - self.last_call)
-        if wait > 0:
-            time.sleep(wait)
-        self.last_call = time.monotonic()
-        resp = self.session.get(
-            "https://www.alphavantage.co/query",
-            params={"function": "FX_INTRADAY", "from_symbol": symbol.split(":")[1][:3],
-                    "to_symbol": symbol.split(":")[1][3:], "interval": f"{timeframe_min}min",
-                    "outputsize": "full" if count > 100 else "compact",
-                    "apikey": settings.ALPHA_VANTAGE_API_KEY},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        key = next((k for k in payload if "Time Series" in str(k)), None)
-        if key is None:
-            raise FeedError(str(payload)[:150])
-        rows = [{"time": pd.Timestamp(ts, tz="UTC"),
-                 "open": float(v["1. open"]), "high": float(v["2. high"]),
-                 "low": float(v["3. low"]), "close": float(v["4. close"]),
-                 "volume": float(v.get("5. volume", 1) or 1)}
-                for ts, v in payload[key].items()]
-        return pd.DataFrame(rows).sort_values("time").tail(max(count, 30)).reset_index(drop=True)
+        """Fetch candles from the terminal."""
+        self._ensure()
+        tf_map = {1: "M1", 5: "M5", 15: "M15", 60: "H1", 240: "H4", 1440: "D1"}
+        tf = getattr(self.mt5, f"TIMEFRAME_{tf_map.get(timeframe_min, 'M15')}")
+        rates = self.mt5.copy_rates_from_pos(pair.upper(), tf, 0, max(count, 30))
+        if rates is None or not len(rates):
+            raise FeedError(f"no rates for {pair}")
+        df = pd.DataFrame(rates)
+        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        return df.rename(columns={"tick_volume": "volume"})[
+            ["time", "open", "high", "low", "close", "volume"]
+        ].tail(max(count, 30)).reset_index(drop=True)
 
 
 class TwelveDataFeed:
-    """Secondary feed: Twelve Data."""
+    """TERTIARY feed: Twelve Data (800 requests/day free; last resort)."""
 
     name = "twelve_data"
 
@@ -148,6 +192,7 @@ class TwelveDataFeed:
     def configured(self) -> bool:
         """False when no API key is set."""
         return bool(settings.TWELVE_DATA_API_KEY)
+
     def __init__(self) -> None:
         self.session = requests.Session()
 
@@ -180,7 +225,7 @@ class TwelveDataFeed:
 
 
 class YFinanceFeed:
-    """Keyless fallback feed backed by Yahoo Finance (EURUSD=X, GC=F, ^NDX...).
+    """SECONDARY feed: Yahoo Finance (free, keyless, TTL-cached).
 
     15m candles exist for the last ~59 days only; higher timeframes map to
     longer lookbacks. FX symbols report volume=0, which validate_ohlcv may
@@ -272,58 +317,6 @@ class YFinanceFeed:
         return out
 
 
-class MT5Feed:
-    """Tertiary feed: MT5 terminal (guarded import)."""
-
-    name = "mt5"
-
-    @property
-    def configured(self) -> bool:
-        """False when the MetaTrader5 package is unavailable on this OS."""
-        try:
-            import MetaTrader5  # noqa: F401
-            return True
-        except ImportError:
-            return False
-
-    def __init__(self) -> None:
-        self.mt5 = None
-        self._connected = False
-
-    def _ensure(self) -> bool:
-        """Initialize MT5 once."""
-        if self._connected:
-            return True
-        try:
-            import MetaTrader5 as mt5  # type: ignore
-        except ImportError as exc:
-            raise FeedError("MetaTrader5 unavailable") from exc
-        kwargs = {"server": settings.MT5_SERVER} if settings.MT5_SERVER else {}
-        if not mt5.initialize(**kwargs):
-            raise FeedError(f"initialize failed: {mt5.last_error()}")
-        if settings.MT5_LOGIN:
-            if not mt5.login(int(settings.MT5_LOGIN), password=settings.MT5_PASSWORD,
-                             server=settings.MT5_SERVER):
-                raise FeedError(f"login failed: {mt5.last_error()}")
-        self.mt5 = mt5
-        self._connected = True
-        return True
-
-    def fetch(self, pair: str, timeframe_min: int, count: int) -> pd.DataFrame:
-        """Fetch candles from the terminal."""
-        self._ensure()
-        tf_map = {1: "M1", 5: "M5", 15: "M15", 60: "H1", 240: "H4", 1440: "D1"}
-        tf = getattr(self.mt5, f"TIMEFRAME_{tf_map.get(timeframe_min, 'M15')}")
-        rates = self.mt5.copy_rates_from_pos(pair.upper(), tf, 0, max(count, 30))
-        if rates is None or not len(rates):
-            raise FeedError(f"no rates for {pair}")
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        return df.rename(columns={"tick_volume": "volume"})[
-            ["time", "open", "high", "low", "close", "volume"]
-        ].tail(max(count, 30)).reset_index(drop=True)
-
-
 @dataclass
 class CandleData:
     """Validated candle bundle for one pair/timeframe."""
@@ -350,22 +343,54 @@ class CandleData:
 
 
 class MarketDataEngine:
-    """Failover engine with consensus checks and latency monitoring."""
+    """Failover engine with validation, switch auditing and status reporting."""
 
     def __init__(self, feeds: Optional[list] = None, failover_deadline_sec: float = 5.0) -> None:
+        # PRIMARY -> SECONDARY -> TERTIARY. MT5 first: it is the free,
+        # unlimited, broker-direct feed wherever the terminal exists (Windows
+        # VPS / local Windows). On Linux hosts its `configured` is False and
+        # the engine transparently leans on yfinance (secondary).
         self.feeds = feeds if feeds is not None else [
-            AlphaVantageFeed(), TwelveDataFeed(), YFinanceFeed(), MT5Feed(),
+            MT5Feed(), YFinanceFeed(), TwelveDataFeed(),
         ]
         self.failover_deadline_sec = failover_deadline_sec
         self.consecutive_failures = 0
+        self.active_feed = "none"
+        self.last_update: Optional[datetime] = None
         self._latencies: list[float] = []
         self._cache: dict[str, CandleData] = {}
+
+    # ---- status (consumed by AutoRecovery + /health) ----
+
+    def get_feed_status(self) -> dict:
+        """Current failover posture for monitoring/auto-recovery."""
+        return {
+            "active_feed": self.active_feed,
+            "last_update": self.last_update.isoformat() if self.last_update else None,
+            "consecutive_failures": self.consecutive_failures,
+            "feeds_configured": [f.name for f in self.feeds
+                                 if getattr(f, "configured", True)],
+            "mt5_connected": self._mt5_connected(),
+        }
+
+    def _mt5_connected(self) -> bool:
+        """MT5 terminal reachable (False when the package is unavailable)."""
+        for feed in self.feeds:
+            if feed.name == "mt5":
+                try:
+                    return bool(feed.connected())
+                except Exception:
+                    return False
+        return False
+
+    # ---- fetching with failover ----
 
     def get_candles(self, pair: str, timeframe_min: int = 15, count: int = 300) -> CandleData:
         """Fetch validated candles with feed failover inside the deadline."""
         deadline = time.monotonic() + self.failover_deadline_sec
         errors: list[str] = []
         freshness = max(settings.STALENESS_LIMIT_SEC, timeframe_min * 60 * 2)
+        previous_source = self.active_feed
         for attempt in range(len(self.feeds)):
             feed = self.feeds[attempt % len(self.feeds)]
             if not getattr(feed, "configured", True):
@@ -384,6 +409,7 @@ class MarketDataEngine:
                 )
                 self.consecutive_failures = 0
                 self._cache[f"{pair}_{timeframe_min}"] = candle
+                self._mark_feed_ok(feed.name, previous_source)
                 return candle
             except Exception as exc:
                 errors.append(f"{feed.name}: {exc}")
@@ -396,6 +422,20 @@ class MarketDataEngine:
         if cached is not None:
             return cached
         raise FeedError(f"all feeds failed for {pair}: {errors}")
+
+    def _mark_feed_ok(self, feed_name: str, previous_source: str) -> None:
+        """Record the active feed; audit-log every feed switch to Supabase."""
+        self.active_feed = feed_name
+        self.last_update = datetime.now(timezone.utc)
+        if previous_source != feed_name:
+            logger.warning("FEED SWITCH: %s -> %s", previous_source, feed_name)
+            try:
+                db.audit("data", "feed_switch",
+                         f"{previous_source} -> {feed_name} "
+                         f"(failures={self.consecutive_failures})")
+                db.log_feed_health("data_feeds", True, f"active feed {feed_name}")
+            except Exception as exc:
+                logger.debug("feed switch audit skipped: %s", exc)
 
     def _record_latency(self, seconds: float) -> None:
         """Track rolling latency; alert above 3s average."""

@@ -163,6 +163,8 @@ def cmd_resume(args: list[str]) -> str:
     """/resume — resume trading and clear breakers."""
     db.set_state("trading_paused", "0")
     db.set_state("dd_halt_active", "0")
+    db.set_state("observation_mode", "0")
+    db.set_state("feed_boot_failure", "0")
     db.resolve_breakers()
     db.audit("operator", "resume", "via telegram")
     return "▶️ Trading resumed. All breakers cleared."

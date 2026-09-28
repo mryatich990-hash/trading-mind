@@ -53,6 +53,8 @@ class TradingSystem:
         self.notifier: Optional[Any] = None
         self.tv_webhook: Optional[Any] = None
         self.email_bridge: Optional[Any] = None
+        self.autorecovery: Optional[Any] = None
+        self._recovery_task: Optional[Any] = None
         self.shutdown = GracefulShutdown(bus)
         self._cycle_lock = asyncio.Lock()
         self._last_manage = 0.0
@@ -102,6 +104,17 @@ class TradingSystem:
                                           research_engine=self.research)
         self.risk = RiskManager()
         self.breakers = CircuitBreakers(notifier=self.notifier.send)
+
+        # self-healing loop: feed watch, MT5 reconnect, auto-resume
+        try:
+            from core.autorecovery import AutoRecovery
+
+            self.autorecovery = AutoRecovery(
+                data_engine=self.data, breakers=self.breakers,
+                notifier=self.notifier.send if self.notifier else None)
+        except Exception as exc:  # pragma: no cover
+            self.autorecovery = None
+            logger.warning("autorecovery unavailable: %s", exc)
 
         # operator commands get live refs
         try:
@@ -179,6 +192,7 @@ class TradingSystem:
         check("event_bus", self._check_event_bus)
 
         failed = [n for n, ok, _ in results if not ok]
+        self._failed_checks = failed
         all_ok = not failed
         db.set_state("startup_checks_passed", "1" if all_ok else "0")
         db.audit("system", "startup_checks",
@@ -245,16 +259,58 @@ class TradingSystem:
             return False, f"broker error: {exc}"
 
     def _check_feeds(self) -> tuple[bool, str]:
-        """Check 4: validated candles for the first configured pair."""
-        from data.market_data_engine import FeedError
+        """Check 4: verify every configured feed, trade only if one works.
+
+        MT5 is probed directly (tick age); yfinance/TwelveData via a real
+        validated fetch. Fails ONLY when every configured feed is dead ->
+        bot refuses to start. One healthy feed (e.g. yfinance-only cloud)
+        passes with a summary of the per-feed results.
+        """
+        from data.market_data_engine import fx_market_closed, validate_ohlcv
 
         pair = settings.TRADING_PAIRS[0]
-        try:
-            candle = self.data.get_candles(pair, 15, 60)
-            return True, f"{pair} m15 ok via {candle.source} ({len(candle.df)} rows)"
-        except Exception as exc:
-            return False, f"feed failure for {pair}: {exc}" if not isinstance(
-                exc, FeedError) else str(exc)[:200]
+        closed = fx_market_closed()
+        results: dict[str, bool] = {}
+        details: list[str] = []
+
+        # 1. MT5: fresh tick (< 120s old) proves the terminal + broker link.
+        mt5_feed = next((f for f in self.data.feeds if f.name == "mt5"), None)
+        if mt5_feed is not None and mt5_feed.configured:
+            age = mt5_feed.tick_age_sec(pair)
+            results["mt5"] = age is not None and age < 120
+            details.append(f"mt5={'OK' if results['mt5'] else 'DEAD'}"
+                           + (f" (tick {age:.0f}s)" if age is not None else ""))
+
+        # 2. yfinance: a real validated candle fetch (respects TTL cache).
+        yf_feed = next((f for f in self.data.feeds if f.name == "yfinance"), None)
+        if yf_feed is not None:
+            try:
+                candle = yf_feed.fetch(pair, 15, 60)
+                err = validate_ohlcv(candle, pair, settings.STALENESS_LIMIT_SEC)
+                results["yfinance"] = err is None
+                details.append(f"yfinance={'OK' if results['yfinance'] else 'BAD'}"
+                               + (f" ({err})" if err else " (60 rows)"))
+            except Exception as exc:
+                results["yfinance"] = False
+                details.append(f"yfinance=DEAD ({str(exc)[:60]})")
+
+        # 3. Twelve Data: probe only when its key is configured.
+        td_feed = next((f for f in self.data.feeds if f.name == "twelve_data"), None)
+        if td_feed is not None and td_feed.configured:
+            try:
+                td_feed.fetch(pair, 15, 30)
+                results["twelve_data"] = True
+                details.append("twelve_data=OK")
+            except Exception as exc:
+                results["twelve_data"] = False
+                details.append(f"twelve_data=DEAD ({str(exc)[:60]})")
+
+        detail = f"{pair} " + ("; ".join(details) if details else "no feeds configured")
+        if results and any(results.values()):
+            if closed:
+                detail += " [weekend close: staleness expected]"
+            return True, detail
+        return False, detail + " -> NO FEEDS AVAILABLE, refusing to start"
 
     def _check_groq(self) -> tuple[bool, str]:
         """Check 5: Groq reachable (warning-only when no key: research auto-accepts)."""
@@ -332,21 +388,54 @@ class TradingSystem:
         loop = asyncio.get_running_loop()
         self.shutdown.install(loop)
         db.set_state("running", "1")
+        db.set_state("auto_recovered", "0")
+        db.set_state("feed_boot_failure", "0")
 
         if self.notifier:
             self.notifier.start_polling()
 
         session_ok = self.run_startup_checks()
+        db.set_state("observation_mode", "0" if session_ok else "1")
+
+        # AutoRecovery: background self-healing (feed watch, MT5 reconnect,
+        # auto-resume when no breakers). Starts regardless of startup outcome:
+        # a feed-dead boot is precisely the case it must heal.
+        if self.autorecovery is not None:
+            self._recovery_task = asyncio.create_task(self.autorecovery.monitor())
+            logger.info("autorecovery monitor started (60s cadence)")
+
         if not session_ok:
             db.set_state("observation_mode", "1")
-            if self.notifier:
-                self.notifier.send("⚠️ Startup checks failed: entering observation mode. "
-                                   "Trading disabled until /resume.")
-            db.audit("system", "observation_mode", "startup checks failed")
+            feed_only = set(getattr(self, "_failed_checks", [])) <= {
+                "data_feeds", "circuit_breakers"}
+            if feed_only:
+                # Recovery path: AutoRecovery clears observation mode and
+                # resumes once any feed produces valid candles again.
+                db.set_state("feed_boot_failure", "1")
+                db.audit("system", "observation_mode",
+                         "feed-only startup failure; auto-recovery armed")
+                if self.notifier:
+                    self.notifier.send("⚠️ Startup checks failed (data feeds dead): "
+                                       "observation mode. AutoRecovery will resume "
+                                       "trading when a feed recovers.")
+            else:
+                if self.notifier:
+                    self.notifier.send("⚠️ Startup checks failed: entering observation "
+                                       "mode. Trading disabled until /resume.")
+                db.audit("system", "observation_mode", "startup checks failed")
 
         try:
             while not self.shutdown.shutting_down:
                 now = time.monotonic()
+
+                # observation mode is the single source of truth for trading
+                # permission: cleared by AutoRecovery (feed healed) or /resume.
+                if not session_ok and db.get_state("observation_mode", "0") == "0":
+                    session_ok = True
+                    db.audit("system", "trading_reenabled",
+                             "observation mode cleared; trading re-enabled")
+                    logger.info("trading re-enabled: observation mode cleared")
+
                 try:
                     await self._trading_cycle(session_ok)
                 except Exception as exc:
@@ -369,6 +458,8 @@ class TradingSystem:
 
                 await self._wait_for_interval()
         finally:
+            if self._recovery_task is not None:
+                self._recovery_task.cancel()
             await self.shutdown.run(self._close_all_trades)
 
     async def _wait_for_interval(self) -> None:

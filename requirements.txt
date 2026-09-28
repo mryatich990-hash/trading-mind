@@ -14,6 +14,9 @@ psycopg2-binary==2.9.11
 supabase>=2.0
 
 # --- Data / numerics ---
+# yfinance: SECONDARY data feed (keyless; effective primary on Linux/Render
+# where the MetaTrader5 package does not exist). No API key, no daily cap.
+# MetaTrader5 (PRIMARY feed) stays a guarded, commented install below.
 pandas==3.0.6
 numpy==2.5.3
 yfinance==1.7.0
@@ -36,7 +39,8 @@ matplotlib==3.11.2
 # --- Testing ---
 pytest==9.1.1
 
-# --- Optional live broker (Windows/macOS only; guarded import in code) ---
+# --- PRIMARY data feed: MetaTrader 5 terminal (Windows/macOS only) ---
+# Guarded import in data/market_data_engine.py; uncomment on a Windows host:
 # MetaTrader5==5.0.4522
 
 # --- cTrader Open API (Linux-native broker; Pepperstone/IC Markets etc.) ---

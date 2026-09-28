@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import requests
 
 from config import settings
@@ -117,28 +118,30 @@ class IntermarketAnalyzer:
             out.append(value)
         return out[0], out[1]
 
+    # legacy Alpha Vantage symbol -> Yahoo symbol (AV removed system-wide)
+    _YF_MAP = {"VIX": "^VIX", "VIX3M": "^VIX3M", "DXY": "DX-Y.NYB"}
+
     def fetch_series_last(self, symbol: str, n: int = 25) -> list[float]:
-        """Last n closes of a daily series from Alpha Vantage (empty on failure)."""
-        if not settings.ALPHA_VANTAGE_API_KEY:
+        """Last n daily closes via yfinance (empty on failure).
+
+        Alpha Vantage was removed system-wide (25 req/day free tier caused a
+        54+ hour feed outage); yfinance is keyless with no daily cap.
+        """
+        try:
+            import yfinance as yf
+
+            yf_symbol = self._YF_MAP.get(symbol, symbol)
+            df = yf.download(yf_symbol, period=f"{max(n, 10)}d", interval="1d",
+                             progress=False, auto_adjust=False)
+            if df is None or df.empty:
+                return []
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            col = "Close" if "Close" in df.columns else "close"
+            closes = [float(v) for v in df[col].dropna().tolist()]
+            return closes[-n:]
+        except Exception:
             return []
-        data = self._get_json(
-            "https://www.alphavantage.co/query",
-            {"function": "TIME_SERIES_DAILY", "symbol": symbol,
-             "outputsize": "compact", "apikey": settings.ALPHA_VANTAGE_API_KEY},
-        )
-        if not data:
-            return []
-        key = next((k for k in data if "Time Series" in str(k)), None)
-        if key is None:
-            return []
-        series = data[key]
-        closes = []
-        for ts in sorted(series.keys())[-n:]:
-            try:
-                closes.append(float(series[ts]["4. close"]))
-            except (KeyError, ValueError, TypeError):
-                continue
-        return closes
 
     def fetch_vix(self) -> tuple[float, float]:
         """(VIX, VIX3M) latest values."""

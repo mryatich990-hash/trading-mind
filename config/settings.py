@@ -90,7 +90,9 @@ GROQ_MAX_REJECTIONS = env_int("GROQ_MAX_REJECTIONS", 5)
 
 # ---- news / data feeds ----
 NEWS_API_KEY = env_str("NEWS_API_KEY")
-ALPHA_VANTAGE_API_KEY = env_str("ALPHA_VANTAGE_API_KEY")
+# NOTE: Alpha Vantage REMOVED as a data feed (25 req/day free tier caused a
+# 54+ hour feed outage). Feed chain: MT5 (primary, guarded) -> yfinance
+# (secondary) -> Twelve Data (tertiary).
 TWELVE_DATA_API_KEY = env_str("TWELVE_DATA_API_KEY")
 FRED_API_KEY = env_str("FRED_API_KEY")
 MYFXBOOK_API_KEY = env_str("MYFXBOOK_API_KEY")
