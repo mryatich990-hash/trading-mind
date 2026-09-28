@@ -266,6 +266,18 @@ class YFinanceFeed:
         if hit is not None and now - hit[0] < YFinanceFeed._CACHE_TTL:
             return hit[1].copy()
         interval, days = self._INTERVALS.get(timeframe_min, ("15m", 59))
+        # Size the fetch window from the bars actually requested. The old
+        # fixed windows (59d of 15m ≈ 4,800 bars for a 300-bar frame, 180d of
+        # 60m ≈ 9,000) produced multi-second payloads and Yahoo throttling
+        # ("possibly delisted" errors). FX trades ~5 days/week.
+        bars_needed = max(count, 30)
+        if timeframe_min == 240:
+            bars_needed *= 4  # h4 frames are built from 60m bars
+        if interval == "1d":
+            days = max(2, min(days, bars_needed * 7 // 5 + 3))
+        else:
+            bars_per_day = max(1, 1440 // (60 if timeframe_min == 240 else timeframe_min))
+            days = max(2, min(days, bars_needed * 7 // (5 * bars_per_day) + 3))
         if interval == "1m":
             days = min(days, 7)
         df = None
