@@ -42,6 +42,9 @@ class GroqVerifier:
         self.threshold = threshold or settings.GROQ_VERIFY_THRESHOLD
         self.max_consecutive = max_consecutive or settings.GROQ_MAX_REJECTIONS
         self._consecutive = 0
+        # Tracks HTTP/transport failures so a Groq outage is never mis-counted
+        # as a factual rejection (an outage should not halt the bot).
+        self._consecutive_errors = 0
 
     @staticmethod
     def _numbers_with_decimals(text: str) -> list[tuple[float, int]]:
@@ -128,11 +131,22 @@ class GroqVerifier:
             response = self.brain.ask_json(pair=pair, stage=f"research:{attempt}",
                                            prompt=prompt, temperature=0.0)
             if response is None:
-                self._register(pair, "json_unparseable", 0.0, [], "")
+                # Distinguish transport/HTTP failure (ask_json already retried
+                # and audited the error) from a model that answered but produced
+                # unparseable output. Only the latter is a factual rejection:
+                # a Groq outage must never escalate into a trading halt.
+                if self._last_call_errored(pair):
+                    self._consecutive_errors += 1
+                    logger.warning("groq unreachable for %s (attempt %d/%d) "
+                                   "-- not counted as rejection",
+                                   pair, attempt, max_attempts)
+                else:
+                    self._register(pair, "json_unparseable", 0.0, [], "")
                 continue
             result = self.verify(response, prompt)
             if result.accepted:
                 self._consecutive = 0
+                self._consecutive_errors = 0
                 return response
             self._register(pair, result.reason, result.score, result.failed_claims,
                            json.dumps(response)[:2000])
@@ -143,6 +157,24 @@ class GroqVerifier:
                     "reasoning": {"against_case": "unverifiable AI output"},
                     "_forced_skip": True}
         return None
+
+    def _last_call_errored(self, pair: str) -> bool:
+        """True when the most recent ask_json None came from an HTTP error.
+
+        ask_json audits every failure; an 'ERROR: ' prefix in the latest
+        audit row for this pair means transport failure, not model output.
+        """
+        try:
+            from sqlalchemy import text as sqltext
+
+            from core.db import engine
+            with engine.connect() as conn:
+                row = conn.execute(sqltext(
+                    "SELECT response FROM groq_audit WHERE pair = :p "
+                    "ORDER BY created_at DESC LIMIT 1"), {"p": pair}).first()
+            return bool(row and str(row[0]).startswith("ERROR: "))
+        except Exception:
+            return False
 
     def _register(self, pair: str, reason: str, score: float,
                   claims: list[str], raw: str) -> None:

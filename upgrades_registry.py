@@ -28,12 +28,28 @@ def get_registry() -> Optional["UpgradeRegistry"]:
     return _registry
 
 
+class _CallableNotifier:
+    """Wrap a bare callable so sub-engines can call ``notifier.send(...)``."""
+
+    def __init__(self, fn: Any) -> None:
+        self._fn = fn
+
+    def send(self, text: str) -> Any:
+        return self._fn(text)
+
+
 class UpgradeRegistry:
     """Owns all upgrade modules + their background loops."""
 
     def __init__(self, data_engine=None, notifier=None, pairs: Optional[list[str]] = None,
                  event_bus=None) -> None:
         self.data = data_engine
+        # Accept a Bot-style object (.send) OR a bare callable (historically
+        # main.py passed notifier.send here, and engines calling
+        # notifier.send() on it crashed the statarb loop every cycle).
+        # Normalize FIRST so every sub-engine receives the same wrapper.
+        if notifier is not None and not hasattr(notifier, "send"):
+            notifier = _CallableNotifier(notifier)
         self.notifier = notifier
         self.pairs = [p.upper() for p in (pairs or settings.TRADING_PAIRS[:5])]
         self.bus = event_bus

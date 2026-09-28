@@ -65,7 +65,8 @@ def fx_market_closed(now: Optional[datetime] = None) -> bool:
             or (weekday == 6 and hour < 21))
 
 
-def validate_ohlcv(df: pd.DataFrame, pair: str, max_age_sec: float) -> Optional[str]:
+def validate_ohlcv(df: pd.DataFrame, pair: str, max_age_sec: float,
+                   timeframe_min: int = 15) -> Optional[str]:
     """Validate candles: freshness, OHLC logic, volume, freeze, anomalies."""
     if df is None or len(df) < 30:
         return "insufficient rows"
@@ -84,8 +85,11 @@ def validate_ohlcv(df: pd.DataFrame, pair: str, max_age_sec: float) -> Optional[
         return "zero volume on recent candles"
     if np.any(~np.isfinite(o)) or np.any(~np.isfinite(h)) or np.any(~np.isfinite(l)) or np.any(~np.isfinite(c)):
         return "NaN/inf in OHLC"
-    # data freeze: 3 identical consecutive candles (expected while closed)
-    closes_tail = df["close"].tail(3).to_numpy(float)
+    # data freeze: identical consecutive candles (expected while closed).
+    # Sub-15m bars need a longer run: three quiet 1m minutes on EURUSD are
+    # normal and must not look like a frozen feed.
+    freeze_run = 5 if timeframe_min < 15 else 3
+    closes_tail = df["close"].tail(freeze_run).to_numpy(float)
     if len(set(closes_tail.tolist())) == 1 and not market_closed:
         return "data freeze detected"
     # anomaly: candle range > 5x 20-period average ATR
@@ -238,7 +242,7 @@ class YFinanceFeed:
         "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X",
         "USDCHF": "USDCHF=X", "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X",
         "USDCAD": "USDCAD=X", "GBPJPY": "GBPJPY=X", "EURJPY": "EURJPY=X",
-        "XAUUSD": "GC=F", "NAS100": "^NDX", "US30": "^DJI",
+        "XAUUSD": "GC=F", "NAS100": "NQ=F", "US30": "YM=F",
     }
     _INTERVALS = {1: ("1m", 7), 5: ("5m", 40), 15: ("15m", 59),
                   60: ("60m", 120), 240: ("60m", 180), 1440: ("1d", 730)}
@@ -438,7 +442,15 @@ class MarketDataEngine:
         """Fetch validated candles with feed failover inside the deadline."""
         deadline = time.monotonic() + self.failover_deadline_sec
         errors: list[str] = []
-        freshness = max(settings.STALENESS_LIMIT_SEC, timeframe_min * 60 * 2)
+        # Yahoo streams 1m/5m FUTURES candles with a ~10-minute delay; a
+        # strict 2-candle freshness floor made XAUUSD 1m fail forever
+        # (~10.5 min lag vs 600s limit), which kept the stability clock from
+        # ever accumulating and wedged the breaker machine in halt limbo.
+        # Cap: a sub-15m candle older than 15 min is genuinely dead.
+        if timeframe_min < 15:
+            freshness = max(settings.STALENESS_LIMIT_SEC, 15 * 60)
+        else:
+            freshness = max(settings.STALENESS_LIMIT_SEC, timeframe_min * 60 * 2)
         previous_source = self.active_feed
         for attempt in range(len(self.feeds)):
             feed = self.feeds[attempt % len(self.feeds)]
@@ -447,7 +459,7 @@ class MarketDataEngine:
             started = time.monotonic()
             try:
                 df = feed.fetch(pair, timeframe_min, count)
-                err = validate_ohlcv(df, pair, freshness)
+                err = validate_ohlcv(df, pair, freshness, timeframe_min)
                 if err:
                     raise FeedError(err)
                 latency = time.monotonic() - started

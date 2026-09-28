@@ -112,7 +112,7 @@ class TradingSystem:
 
             self.autorecovery = AutoRecovery(
                 data_engine=self.data, breakers=self.breakers,
-                notifier=self.notifier.send if self.notifier else None)
+                notifier=self.notifier.send if self.notifier else None)  # callable
         except Exception as exc:  # pragma: no cover
             self.autorecovery = None
             logger.warning("autorecovery unavailable: %s", exc)
@@ -308,7 +308,7 @@ class TradingSystem:
             try:
                 candle = yf_feed.fetch(pair, 15, 60)
                 freshness = max(settings.STALENESS_LIMIT_SEC, 15 * 60 * 2)
-                err = validate_ohlcv(candle, pair, freshness)
+                err = validate_ohlcv(candle, pair, freshness, 15)
                 results["yfinance"] = err is None
                 details.append(f"yfinance={'OK' if results['yfinance'] else 'BAD'}"
                                + (f" ({err})" if err else " (60 rows)"))
@@ -408,6 +408,23 @@ class TradingSystem:
         # retire pre-state-machine halt rows first (one-time migration)
         if self.breakers is not None:
             self.breakers._retire_legacy_data_stale_halt()
+            # Reconcile downtime artifacts: rows like feed_dead/groq_rejections
+            # persisted while the process was OFF. Live checks just proved the
+            # feed healthy and Groq reachable, so stale halt rows must not
+            # wedge the machine in halted/limbo. Environment halts (weekend)
+            # and account halts (margin) are re-created within a cycle.
+            import time as _time
+            for name in db.unresolved_breakers("halt"):
+                if name == "weekend":
+                    continue  # genuine environment state, not downtime residue
+                self.breakers.resolve(name, notify=False)
+                logger.info("startup: cleared stale halt row '%s' (live checks healthy)", name)
+            # a halt posture persisted across downtime is stale too: live
+            # checks (feeds, Groq, DB, broker) have all just passed
+            if not db.unresolved_breakers("halt") \
+                    and self.breakers.get_engine_state() == "halted":
+                self.breakers._persist_state("running")
+                logger.info("startup: engine state reset halted -> running")
         active = db.unresolved_breakers("halt")
         if active:
             return False, f"unresolved halts: {', '.join(active)}"
@@ -720,6 +737,14 @@ class TradingSystem:
         """Periodic breaker evaluation, correlation audit and heartbeat."""
         broker = self._active_broker_or_none()
         groq_ok = self.brain.health_check() if (self.brain and self.brain.available) else True
+        # Auto-resume after a groq_rejections halt once the brain answers
+        # healthily again (2 consecutive healthy probes). Without this the
+        # halt row stayed forever and the bot never traded again.
+        try:
+            if self.breakers.maybe_resume_after_groq_recovery(groq_ok):
+                logger.info("health: groq_rejections cleared, trading resumed")
+        except Exception as exc:
+            logger.warning("groq recovery check failed: %s", exc)
         feed_age = 0.0
         vix = 0.0
         margin_level = 1000.0
@@ -850,7 +875,7 @@ def main() -> None:
         from upgrades_registry import init_upgrade_registry
 
         init_upgrade_registry(data_engine=system.data,
-                              notifier=system.notifier.send if system.notifier else None,
+                              notifier=system.notifier,
                               pairs=settings.TRADING_PAIRS[:5])
     except Exception as exc:  # pragma: no cover - optional integration
         logger.warning("upgrade registry not started: %s", exc)

@@ -356,6 +356,27 @@ class CircuitBreakers:
             self._transition("observation", from_state=prev)  # one more stable window to RUNNING
         # else: stay halted until the feed proves itself for 5 minutes
 
+    def maybe_resume_after_groq_recovery(self, groq_ok: bool) -> bool:
+        """Auto-resume after a groq_rejections halt once Groq is healthy again.
+
+        The rejection count resets inside GroqVerifier as soon as a research
+        call verifies; this clears the stale halt row and re-enables trading
+        on the next health cycle. Returns True when a halt was lifted.
+        """
+        if groq_ok:
+            self._consecutive_groq_fails = 0
+        else:
+            self._consecutive_groq_fails = getattr(self, "_consecutive_groq_fails", 0) + 1
+            return False  # require two consecutive healthy probes before resuming
+
+        if not self.is_active("groq_rejections"):
+            return False
+        self.resolve("groq_rejections")
+        if self.get_engine_state() == "halted" \
+                and not self.has_active_breakers():
+            self._transition("running")
+        return True
+
     # ---- feed rules (shared by evaluate() and the 30s AutoRecovery loop) ----
 
     def evaluate_feed_rules(self, *, feed_age_sec: float = 0.0,

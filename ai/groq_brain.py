@@ -35,7 +35,10 @@ class GroqBrain:
         self.session = requests.Session()
         if self.api_key:
             self.session.headers.update(
-                {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+                {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json",
+                 # Cloudflare (error 1010) sometimes blocks default lib CEOs;
+                 # a plain custom UA avoids fingerprint blocks.
+                 "User-Agent": "trading-bot/1.0"})
 
     @property
     def available(self) -> bool:
@@ -63,7 +66,14 @@ class GroqBrain:
         if not self.available:
             return None, 0
         payload = {
-            "model": self.model, "temperature": temperature, "max_tokens": 900,
+            "model": self.model, "temperature": temperature,
+            # Reasoning models (gpt-oss-*) burn completion tokens on hidden
+            # reasoning BEFORE writing the answer; 900 reliably truncated the
+            # JSON mid-document (Groq 400 json_validate_failed) which tripped
+            # the groq_rejections halt and stopped all trading.
+            "max_tokens": 4000,
+            # 'low' keeps hidden reasoning short so the answer has budget.
+            "reasoning_effort": "low",
             "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": SYSTEM_INSTRUCTION},
                          {"role": "user", "content": prompt}],
@@ -73,7 +83,15 @@ class GroqBrain:
             resp = self.session.post(GROQ_URL, json=payload, timeout=30)
             resp.raise_for_status()
             latency = int((time.monotonic() - started) * 1000)
-            content = resp.json()["choices"][0]["message"]["content"]
+            message = resp.json()["choices"][0]["message"]
+            content = message.get("content") or ""
+            if not content.strip():
+                # Some reasoning models return content in a secondary field,
+                # or empty when reasoning consumed the entire token budget.
+                content = message.get("reasoning") or ""
+            if not content.strip():
+                raise ValueError("empty completion content (reasoning consumed "
+                                 "the token budget?)")
             self._audit(pair, stage, prompt, content, attempt=1, temperature=temperature,
                         latency=latency)
             return content, latency
