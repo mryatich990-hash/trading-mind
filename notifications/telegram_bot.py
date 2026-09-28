@@ -42,7 +42,11 @@ class TelegramBot:
 
     def _call(self, method: str, payload: Optional[dict] = None,
               retries: int = 3) -> Optional[dict]:
-        """Telegram API call with exponential backoff; None on failure."""
+        """Telegram API call with exponential backoff; None on failure.
+
+        Deterministic 4xx errors (400 bad payload, 401 bad token) are not
+        retried: only 429/5xx/network errors benefit from backoff.
+        """
         if not self.token:
             return None
         for attempt in range(1, retries + 1):
@@ -51,6 +55,14 @@ class TelegramBot:
                                          json=payload or {}, timeout=15)
                 resp.raise_for_status()
                 return resp.json()
+            except requests.HTTPError as exc:
+                status = getattr(exc.response, "status_code", 0)
+                if 400 <= status < 500 and status != 429:
+                    logger.warning("telegram %s failed (permanent %d): %s",
+                                   method, status, str(exc)[:120])
+                    return None
+                logger.warning("telegram %s attempt %d failed: %s", method, attempt, exc)
+                time.sleep(2 ** attempt)
             except Exception as exc:
                 logger.warning("telegram %s attempt %d failed: %s", method, attempt, exc)
                 time.sleep(2 ** attempt)
@@ -63,13 +75,21 @@ class TelegramBot:
     # ---- alerts ----
 
     def send(self, text: str, chat_id: Optional[str] = None) -> bool:
-        """Send a message; returns success."""
+        """Send a message; returns success.
+
+        HTML parse_mode first; on Telegram 400 (unbalanced tags, stray
+        <>& in dynamic text) retry once as plain text so critical alerts
+        like the first-trade notification are never swallowed.
+        """
         target = chat_id or self.chat_id
         if not self.token or not target:
             logger.info("telegram (no config): %s", text[:200])
             return False
         data = self._call("sendMessage", {"chat_id": target, "text": text[:4000],
                                           "parse_mode": "HTML"})
+        if not (data and data.get("ok")):
+            data = self._call("sendMessage", {"chat_id": target,
+                                              "text": text[:4000]})
         return bool(data and data.get("ok"))
 
     # ---- command registration ----
