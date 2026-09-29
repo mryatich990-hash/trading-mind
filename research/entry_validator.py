@@ -107,9 +107,17 @@ class EntryValidator:
         m15, h1 = frames["m15"], frames["h1"]
         price = float(m15["close"].iloc[-1])
         direction_buy = direction == "buy"
-        m15_vol_sum = float(pd.to_numeric(m15["volume"], errors="coerce")
-                            .tail(50).fillna(0).sum())
-        volume_usable = m15_vol_sum > 0.0
+        m15_vol = pd.to_numeric(m15["volume"], errors="coerce").tail(50).fillna(0)
+        m15_vol_sum = float(m15_vol.sum())
+        # Sparse-volume feeds (Yahoo FX: only a few session bars carry any
+        # volume, the rest are 0) slip past an all-zero check but poison the
+        # ratio — the last bar is usually 0, so volume_pct reads 0 and the
+        # check fails as phantom noise (it was the #1 or #2 failure in every
+        # confluence bucket this week). Fewer than 20% of bars carrying any
+        # volume is noise, not data: exclude the item like an all-zero feed.
+        nonzero_bars = int((m15_vol > 0).sum())
+        volume_usable = m15_vol_sum > 0.0 and \
+            nonzero_bars >= max(5, int(0.2 * max(len(m15_vol), 1)))
 
         # step 5 volume metrics only make sense when the feed has volume
         try:

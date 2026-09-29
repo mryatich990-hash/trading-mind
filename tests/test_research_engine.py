@@ -98,6 +98,23 @@ class TestEntryValidator:
         # 9 active checks, no bonus -> score + failed must equal 9
         assert checklist.score + len(checklist.failed_items) == 9
 
+    def test_sparse_volume_feed_excludes_volume_check(self, temp_db):
+        """Yahoo FX volume is SPARSE (a few session bars nonzero): that must
+        count as volumeless, not poison volume_pct with 0 -> phantom denial.
+        This was the #1/#2 failure in every confluence bucket this week."""
+        frames = uptrend_frames()
+        rng = np.random.default_rng(3)
+        n = len(frames["m15"])
+        vol = np.zeros(n)
+        idx = rng.choice(n, size=max(1, n // 50), replace=False)  # ~2% nonzero
+        vol[idx] = rng.integers(100, 1000, size=len(idx)).astype(float)
+        frames["m15"] = frames["m15"].assign(volume=vol)
+        htf = HTFAnalyzer().analyze("EURUSD", frames, "buy")
+        macro = MacroResult(news_gate="clear", cot_bias="neutral")
+        checklist = EntryValidator().validate("EURUSD", "buy", frames, htf, macro)
+        assert "volume_confirmed" not in checklist.failed_items
+        assert checklist.score + len(checklist.failed_items) == 9
+
     def test_real_volume_feed_keeps_volume_check(self, temp_db):
         """With genuine volume data the item stays in the checklist."""
         frames = uptrend_frames()
