@@ -637,7 +637,10 @@ class TradingSystem:
         # funnel — research cycle or TradingView webhook alike. Existing
         # positions continue to be managed by TradeManager.
         if self.breakers is not None \
-                and self.breakers.get_engine_state() == "observation":
+                and self.breakers.get_engine_state() == "observation" \
+                and not settings.LOCAL_SHADOW_MODE:
+            # shadow mode intentionally bypasses this: its whole job is to
+            # keep researching and log would-trades while the cloud trades
             logger.info("signal %s %s suppressed (observation mode)",
                         signal.pair, signal.strategy)
             db.record_research(signal.pair, "suppressed",
