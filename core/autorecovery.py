@@ -133,17 +133,30 @@ class AutoRecovery:
 
         # Boot-heal: the process started with every feed dead (observation
         # mode); a feed now works, so re-enable trading.
+        # Second condition heals a state divergence: startup set
+        # observation_mode=1 (feed check failed while the network was still
+        # down after wake/resume), the breaker machine then booted straight
+        # into "running" and never TRANSITIONS, so nothing ever synced the
+        # flag back to 0 -> permanent suppression. Whenever the machine says
+        # running, the feed is ok, and no operator pause exists, the flag
+        # must follow the machine.
         try:
-            if feed_ok and db.get_state("feed_boot_failure", "0") == "1" \
-                    and self.breakers.get_engine_state() == "running":
-                db.set_state("feed_boot_failure", "0")
-                db.set_state("observation_mode", "0")
-                db.set_state("running", "1")
+            healed = False
+            if feed_ok and self.breakers.get_engine_state() == "running" \
+                    and db.get_state("trading_paused", "0") != "1":
+                if db.get_state("feed_boot_failure", "0") == "1":
+                    db.set_state("feed_boot_failure", "0")
+                    healed = True
+                if db.get_state("observation_mode", "0") == "1":
+                    db.set_state("observation_mode", "0")
+                    db.set_state("running", "1")
+                    healed = True
+            if healed:
                 db.audit("system", "auto_recovery",
-                         "feed recovered after failed boot: trading re-enabled")
+                         "feed healthy + machine running: trading re-enabled")
                 self._notify("✅ Data feed recovered after startup failure — "
                              "bot auto-resumed.")
-                logger.info("recovery: feed-boot failure healed, trading re-enabled")
+                logger.info("recovery: boot observation flag healed, trading re-enabled")
         except Exception as exc:
             logger.error("feed-boot recovery failed: %s", exc)
 
