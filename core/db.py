@@ -348,6 +348,22 @@ def record_research(pair: str, result: str, reason: str, confluence: int = 0,
         s.commit()
 
 
+def has_any_trades() -> bool:
+    """True once at least one trade row exists (any mode/status).
+
+    Expiry condition for the first-trade pilot. Fail-safe: a DB error
+    returns True so the pilot never widens gates when the database is
+    unreachable.
+    """
+    try:
+        with _session() as s:
+            row = s.execute(text(_fix("SELECT 1 FROM trades LIMIT 1"))).first()
+            return row is not None
+    except Exception:
+        logger.exception("has_any_trades query failed (failing closed)")
+        return True
+
+
 def recent_research(limit: int = 5) -> list[dict]:
     """Last N research cycles."""
     with _session() as s:

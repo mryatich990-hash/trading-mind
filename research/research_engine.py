@@ -240,7 +240,27 @@ class ResearchEngine:
             verdict.required_confluence = max(
                 settings.MIN_CONFLUENCE, hist.required_confluence,
                 9 if checklist.required >= 9 else 8)
-            if checklist.score < verdict.required_confluence:
+            # ---- first-trade pilot (optional, one-time) ----
+            # While no trade has ever been recorded, a setup short of the
+            # STATIC floor (MIN_CONFLUENCE only) may proceed, compensated by a
+            # raised Groq conviction floor that binds ONLY when the setup
+            # actually needed the pilot. So a full-score setup keeps the normal
+            # conviction gate and the pilot can never suppress a trade that
+            # steady-state would have approved. History-driven floors (e.g.
+            # poor win rate -> 9) are never relaxed, and the first trade row
+            # voids the pilot forever (state = the DB, nothing to clean up).
+            pilot_used = False
+            if (checklist.score < verdict.required_confluence
+                    and settings.FIRST_TRADE_PILOT_ENABLED
+                    and verdict.required_confluence == settings.MIN_CONFLUENCE
+                    and checklist.score >= settings.FIRST_TRADE_PILOT_CONFLUENCE
+                    and not db.has_any_trades()):
+                logger.info("first-trade pilot: confluence %d/%d accepted pending "
+                            "Groq conviction >= %d", checklist.score,
+                            verdict.required_confluence,
+                            settings.FIRST_TRADE_PILOT_CONVICTION)
+                pilot_used = True
+            if checklist.score < verdict.required_confluence and not pilot_used:
                 reason = (f"step6 confluence {checklist.score}/{verdict.required_confluence} "
                           f"(failed: {', '.join(checklist.failed_items)})")
                 verdict.reason = reason
@@ -255,7 +275,8 @@ class ResearchEngine:
                                                 hist.win_rate, session)
             prompt = self.builder.build(research_data)
             verdict.groq_prompt = prompt
-            decision = self._groq_consensus(pair, prompt)
+            decision = self._groq_consensus(pair, prompt,
+                                            pilot_floor_active=pilot_used)
             if decision is None:
                 reason = "step9 groq: no consensus"
                 verdict.reason = reason
@@ -337,8 +358,14 @@ class ResearchEngine:
             return entry, sl, tp
         return entry, 2 * entry - sl, 2 * entry - tp
 
-    def _groq_consensus(self, pair: str, prompt: str) -> Optional[dict]:
-        """Ask Groq 3x at temperature 0; majority rules, any skip wins."""
+    def _groq_consensus(self, pair: str, prompt: str,
+                        pilot_floor_active: bool = False) -> Optional[dict]:
+        """Ask Groq 3x at temperature 0; majority rules, any skip wins.
+
+        pilot_floor_active: True when the current setup only passed step6 via
+        the first-trade pilot — such setups must clear the raised pilot
+        conviction floor instead of the steady-state one.
+        """
         if self.verifier is None:
             logger.warning("no verifier wired; skipping Groq consensus (auto-accept)")
             return {"decision": "skip", "conviction": 0,
@@ -362,9 +389,11 @@ class ResearchEngine:
         if not majority or len(agreeing) < 2:
             return None
         avg_conv = sum(int(r.get("conviction", 0)) for r in agreeing) / len(agreeing)
-        if avg_conv < settings.GROQ_MIN_CONVICTION:
-            logger.info("groq consensus conviction %.0f < %d", avg_conv,
-                        settings.GROQ_MIN_CONVICTION)
+        min_conv = settings.GROQ_MIN_CONVICTION
+        if pilot_floor_active and settings.FIRST_TRADE_PILOT_ENABLED:
+            min_conv = max(min_conv, settings.FIRST_TRADE_PILOT_CONVICTION)
+        if avg_conv < min_conv:
+            logger.info("groq consensus conviction %.0f < %d", avg_conv, min_conv)
             return None
         best = max(agreeing, key=lambda r: int(r.get("conviction", 0)))
         best["_consensus"] = len(agreeing)

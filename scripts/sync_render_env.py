@@ -20,6 +20,7 @@ SKIP = {
     "DATABASE_URL", "PORT", "REDIS_URL", "TV_WEBHOOK_PORT",
     "DASHBOARD_ENABLED", "DASHBOARD_REFRESH_SEC", "DEMO_GATE_TRADES",
     "DEMO_GATE_WIN_RATE", "DEMO_GATE_PROFIT_FACTOR",  # demo-gate tuning stays local
+    "LOCAL_SHADOW_MODE",  # laptop-only: cloud must NEVER shadow itself
 }
 PREFIX_SKIP = ("MT5_", "MT", "NEXT_PUBLIC_")
 

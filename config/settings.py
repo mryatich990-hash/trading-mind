@@ -112,6 +112,15 @@ TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
 DEMO_MODE = env_bool("DEMO_MODE", True)
 MIN_CONFLUENCE = env_int("MIN_CONFLUENCE", 8)
 MAX_CONFLUENCE = env_int("MAX_CONFLUENCE", 10)
+
+# ---- first-trade pilot (one-time; auto-expires on the first fill) ----
+# While the trades table is empty, a setup short of MIN_CONFLUENCE may trade IF
+# the Groq consensus conviction is exceptional. The expiry condition is the
+# database state itself (no trade rows -> active; first row -> voided forever),
+# so there is no flag to clean up. Steady-state gates are untouched.
+FIRST_TRADE_PILOT_ENABLED = env_bool("FIRST_TRADE_PILOT_ENABLED", False)
+FIRST_TRADE_PILOT_CONFLUENCE = env_int("FIRST_TRADE_PILOT_CONFLUENCE", 7)
+FIRST_TRADE_PILOT_CONVICTION = env_int("FIRST_TRADE_PILOT_CONVICTION", 80)
 MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", 3.0)
 RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", 1.0)
 MAX_RISK_PER_TRADE_PCT = env_float("MAX_RISK_PER_TRADE_PCT", 1.5)
