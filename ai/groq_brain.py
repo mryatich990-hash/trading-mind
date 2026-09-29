@@ -137,7 +137,13 @@ class GroqBrain:
         return None
 
     def health_check(self) -> bool:
-        """Cheap availability probe."""
+        """Cheap TRANSPORT probe (is the Groq API reachable and answering?).
+
+        max_tokens=1 is rejected with 400 for reasoning models (reasoning
+        needs budget), so demanding 200 here made the probe fail forever and
+        groq_rejections halts never auto-resumed. Any sub-500 answer proves
+        the API is alive; answer quality is the verifier's job.
+        """
         if not self.available:
             return False
         try:
@@ -147,7 +153,7 @@ class GroqBrain:
                       "max_tokens": 1},
                 timeout=10,
             )
-            ok = resp.status_code == 200
+            ok = resp.status_code < 500
             db.log_feed_health("groq", ok, f"status={resp.status_code}")
             return ok
         except Exception as exc:
