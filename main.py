@@ -450,11 +450,18 @@ class TradingSystem:
         db.set_state("auto_recovered", "0")
         db.set_state("feed_boot_failure", "0")
 
-        if self.notifier:
+        if self.notifier and not settings.LOCAL_SHADOW_MODE:
+            # shadow copy must not fight the cloud primary for getUpdates
             self.notifier.start_polling()
 
         self._beat()
         session_ok = self.run_startup_checks()
+        if settings.LOCAL_SHADOW_MODE:
+            # Cloud-primary migration: full monitoring + research funnel, but
+            # _process_signal stops before risk/execution (no NEW trades).
+            db.set_state("shadow_mode", "1")
+            logger.warning("LOCAL_SHADOW_MODE: execution disabled locally "
+                           "(cloud instance is the primary trader)")
         db.set_state("observation_mode", "0" if session_ok else "1")
         # seed the state-machine keys so dashboards see the posture
         if self.breakers is not None:
@@ -655,6 +662,17 @@ class TradingSystem:
             self.research.evaluate, signal.pair, signal.direction, signal.strategy,
             signal.entry, signal.sl, signal.tp, signal.session)
         if not verdict.approved:
+            return
+
+        if settings.LOCAL_SHADOW_MODE:
+            # shadow copy: full research done — record what WOULD have traded
+            logger.info("shadow would-trade: %s %s (%s) conf=%s conv=%s",
+                        verdict.pair, verdict.direction, verdict.strategy,
+                        verdict.confluence, verdict.conviction)
+            db.audit("shadow", "would_trade",
+                     f"{verdict.pair} {verdict.direction} {verdict.strategy} "
+                     f"conf={verdict.confluence} conv={verdict.conviction}",
+                     source="shadow")
             return
 
         broker = self._active_broker_or_none()

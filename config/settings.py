@@ -131,6 +131,10 @@ SELECTOR_RETRAIN_TRADES = env_int("SELECTOR_RETRAIN_TRADES", 25)
 # M15 candles close every 15 min; Yahoo/broker feeds legitimately lag several
 # minutes behind. A feed is "truly stale" only after 10 min without updates.
 STALENESS_LIMIT_SEC = env_int("STALENESS_LIMIT_SEC", 600)
+# When the cloud (Render) instance is the primary trader, the local copy runs
+# in shadow mode: full monitoring/research/alerts, but NEW trades disabled so
+# the two engines never double-trade the same signal.
+LOCAL_SHADOW_MODE = env_bool("LOCAL_SHADOW_MODE", False)
 # Feed dead this long (continuously) = full HALT (before that: observation).
 FEED_DEAD_LIMIT_SEC = env_int("FEED_DEAD_LIMIT_SEC", 1800)
 VIX_HALT = env_float("VIX_HALT", 40.0)

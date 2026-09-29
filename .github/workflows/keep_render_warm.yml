@@ -1,0 +1,26 @@
+name: Keep Render warm
+
+# Render free plan sleeps a web service after ~15 min without inbound HTTP.
+# Ping /health every 14 min so the trading engine never spins down.
+# Note: GitHub may disable this schedule after 60 days of repo inactivity —
+# any commit re-arms it, or re-enable manually in the Actions tab.
+
+on:
+  schedule:
+    - cron: "*/14 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 25 \
+              https://trading-bot-f3yn.onrender.com/health || true)
+            echo "attempt $i: HTTP $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 5
+          done
+          echo "::warning::health endpoint did not return 200 after 3 attempts"
