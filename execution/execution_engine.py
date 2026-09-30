@@ -104,8 +104,9 @@ class ExecutionEngine:
 
         broker = self.active_broker()
         if broker is None:
-            logger.warning("no broker healthy; skipping execution (%s %s)",
-                           verdict.pair, verdict.direction)
+            logger.warning("REJECT [no-broker] %s %s (%s): no healthy broker "
+                           "in chain (MT5/OANDA/cTrader/paper all unavailable)",
+                           verdict.pair, verdict.direction, verdict.strategy)
             return None
 
         strategy = verdict.strategy

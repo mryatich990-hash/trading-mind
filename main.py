@@ -559,6 +559,12 @@ class TradingSystem:
             except Exception as exc:
                 logger.exception("remote close-all failed: %s", exc)
 
+        # Operator-forced test trade: runs BEFORE the trading_allowed gate so
+        # the end-to-end pipeline can be verified even during a posture that
+        # suppresses organic signals. Risk + execution still apply in full.
+        if db.get_state("force_trade_requested", "0") == "1":
+            await asyncio.to_thread(self._handle_forced_trade)
+
         for pair in settings.TRADING_PAIRS:
             if self.shutdown.shutting_down:
                 return
@@ -573,10 +579,18 @@ class TradingSystem:
                 if selection.winner is None:
                     continue
                 if not trading_allowed or paused or weekend_locked or observation:
-                    logger.info("signal %s %s suppressed (paused=%s allowed=%s "
-                                "weekend=%s observation=%s)",
-                                pair, selection.winner.direction, paused,
-                                trading_allowed, weekend_locked, observation)
+                    why = []
+                    if not trading_allowed:
+                        why.append("startup-gates")
+                    if paused:
+                        why.append("trading_paused=1")
+                    if weekend_locked:
+                        why.append("weekend-breaker")
+                    if observation:
+                        why.append("observation-posture")
+                    logger.warning("REJECT [cycle-suppressed] %s %s (%s): %s",
+                                   pair, selection.winner.direction,
+                                   selection.winner.strategy, ", ".join(why))
                     continue
                 await self._process_signal(selection.winner)
             except Exception as exc:
@@ -693,6 +707,9 @@ class TradingSystem:
             "demo" if settings.DEMO_MODE else "live",
             verdict.size_multipliers)
         if not decision.approved:
+            logger.warning("REJECT [risk-gate] %s %s (%s): %s",
+                           verdict.pair, verdict.direction, verdict.strategy,
+                           decision.reason)
             db.audit("risk", "rejected",
                      f"{verdict.pair} {verdict.direction}: {decision.reason}",
                      source="main_loop")
@@ -721,6 +738,63 @@ class TradingSystem:
                     registry.record_pending(signal, dl_verdict)
             except Exception:
                 pass
+
+    # ---- operator-forced test trade (end-to-end pipeline verification) ----
+
+    def _handle_forced_trade(self) -> None:
+        """Execute a forced EURUSD 0.01-lot market order through the REAL
+        risk + execution pipeline (no gate skipping). Triggered by the
+        dashboard writing force_trade_requested=1; auto-clears itself."""
+        from decimal import Decimal
+
+        from data.market_data_engine import CandleData
+        from research.research_engine import ResearchVerdict
+
+        try:
+            candle = self.data.get_candles("EURUSD", 15, 2)
+            entry = candle.last_close
+            sl = entry - 20 * 0.0001   # 20 pips
+            tp = entry + 30 * 0.0001   # 30 pips (1.5R)
+            verdict = ResearchVerdict(
+                pair="EURUSD", direction="buy", strategy="forced_test_trade",
+                approved=True, reason="operator-forced end-to-end pipeline test",
+                entry=entry, sl=sl, tp1=tp, tp2=entry + 60 * 0.0001,
+                tp3=entry + 90 * 0.0001, regime="forced-test",
+                conviction=100, consensus_size=1.0, confluence=10,
+                required_confluence=10)
+            broker = self._active_broker_or_none()
+            balance, equity, used = self._account_snapshot(broker)
+            if balance <= 0:
+                balance = float(db.get_state("fallback_balance", "10000") or 10000)
+                equity = equity or balance
+            decision = self.risk.evaluate(
+                "EURUSD", "buy", "forced_test_trade", entry, sl, tp,
+                balance, equity, used, 0.0,
+                [dict(t) for t in db.open_trades()], 0.0, 0.0, 10,
+                "demo" if settings.DEMO_MODE else "live", {})
+            if not decision.approved:
+                logger.warning("REJECT [forced-trade] risk gate denied: %s",
+                               decision.reason)
+                db.audit("operator", "force_trade_denied", decision.reason)
+                return
+            lots = min(Decimal("0.01"), decision.lots) if decision.lots > 0 \
+                else Decimal("0.01")
+            trade_id = self.execution.execute(verdict, lots, balance, 10)
+            if trade_id:
+                db.audit("operator", "force_trade_filled",
+                         f"#{trade_id} EURUSD buy 0.01 @ ~{entry:.5f} "
+                         f"(broker={type(self.execution.active_broker()).__name__})")
+                logger.warning("FORCED TRADE EXECUTED id=%s EURUSD buy 0.01 @ %.5f",
+                               trade_id, entry)
+            else:
+                logger.warning("REJECT [forced-trade] execution returned None "
+                               "(see REJECT [no-broker] / duplicate-suppression lines)")
+                db.audit("operator", "force_trade_failed", "execute returned None")
+        except Exception as exc:
+            logger.exception("forced trade failed: %s", exc)
+            db.audit("operator", "force_trade_failed", str(exc)[:200])
+        finally:
+            db.set_state("force_trade_requested", "0")
 
     @staticmethod
     def _ml_features(signal) -> list[float]:

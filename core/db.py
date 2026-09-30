@@ -13,6 +13,7 @@ from typing import Any, Optional
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from config import settings as _settings  # noqa: F401
 from config.settings import DATABASE_URL, SECRET_KEY  # noqa: F401
 from core.logging_utils import get_logger
 
@@ -169,11 +170,28 @@ def resolve_breakers() -> None:
         s.commit()
 
 
+def _temp_breaker_filter(breakers: list[str]) -> list[str]:
+    """TEMP window: suppress every breaker NOT on the capital-protection
+    allowlist. Auto-expires via settings.temp_breaker_allowlist() (empty list
+    once the window ends -> nothing suppressed, steady state restores)."""
+    allow = _settings.temp_breaker_allowlist()
+    if not allow:
+        return breakers
+    kept = [b for b in breakers if b in allow]
+    dropped = [b for b in breakers if b not in allow]
+    if dropped:
+        logger.warning("TEMP WINDOW: breakers suppressed: %s (allowlist: %s)",
+                       dropped, allow)
+    return kept
+
+
 def unresolved_breakers(severity: str = "halt") -> list[str]:
     """Names of active (unresolved) breakers, default: halt-severity only.
 
     severity="observe" returns observation-severity breakers (e.g. a soft
     data_stale: no new trades, but existing positions keep being managed).
+    During the operator TEMP window, breakers outside the capital-protection
+    allowlist are suppressed (daily_loss / drawdown_halt / margin_halt stay).
     """
     if severity not in ("halt", "observe", "all"):
         severity = "halt"
@@ -187,7 +205,7 @@ def unresolved_breakers(severity: str = "halt") -> list[str]:
                    "WHERE resolved = FALSE AND severity = :sev")
             params = {"sev": severity}
         rows = s.execute(text(_fix(sql)), params).all()
-        return [r[0] for r in rows]
+        return _temp_breaker_filter([r[0] for r in rows])
 
 
 def log_feed_health(component: str, healthy: bool, detail: str = "") -> None:

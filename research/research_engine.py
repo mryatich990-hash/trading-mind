@@ -197,6 +197,8 @@ class ResearchEngine:
             verdict.size_multipliers = dict(macro.size_multipliers)
             if macro.blocked:
                 reason = f"step2 news gate: {macro.news_gate}"
+                logger.warning("REJECT [step2-news] %s %s (%s): %s",
+                               pair, direction, strategy, reason)
                 verdict.reason = reason
                 db.record_research(pair, "blocked", reason)
                 return self._finish(verdict, started)
@@ -223,6 +225,8 @@ class ResearchEngine:
                     signal_tp, session, htf))
                 if mirrored is not None:
                     return mirrored
+                logger.warning("REJECT [step3-htf] %s %s (%s): %s",
+                               pair, direction, strategy, reason)
                 verdict.reason = reason
                 db.record_research(pair, "rejected", reason)
                 return self._finish(verdict, started)
@@ -240,6 +244,17 @@ class ResearchEngine:
             verdict.required_confluence = max(
                 settings.MIN_CONFLUENCE, hist.required_confluence,
                 9 if checklist.required >= 9 else 8)
+            # TEMP window: operator-ordered cap on the confluence floor
+            # (MIN_CONFLUENCE env itself is NOT lowered; the cap is
+            # auto-expiring so steady state restores itself). The cap only
+            # relaxes the OPERATOR floor: history-driven and checklist-driven
+            # requirements (9) are never undercut.
+            _cap = settings.temp_min_confluence()
+            if (_cap and verdict.required_confluence > _cap
+                    and verdict.required_confluence == settings.MIN_CONFLUENCE):
+                logger.warning("TEMP WINDOW: confluence floor capped %d -> %d",
+                               verdict.required_confluence, _cap)
+                verdict.required_confluence = _cap
             # ---- first-trade pilot (optional, one-time) ----
             # While no trade has ever been recorded, a setup short of the
             # STATIC floor (MIN_CONFLUENCE only) may proceed, compensated by a
@@ -263,6 +278,8 @@ class ResearchEngine:
             if checklist.score < verdict.required_confluence and not pilot_used:
                 reason = (f"step6 confluence {checklist.score}/{verdict.required_confluence} "
                           f"(failed: {', '.join(checklist.failed_items)})")
+                logger.warning("REJECT [step6-confluence] %s %s (%s): %s",
+                               pair, direction, strategy, reason)
                 verdict.reason = reason
                 db.record_research(pair, "rejected", reason, checklist.score)
                 return self._finish(verdict, started)
@@ -279,12 +296,19 @@ class ResearchEngine:
                                             pilot_floor_active=pilot_used)
             if decision is None:
                 reason = "step9 groq: no consensus"
+                logger.warning("REJECT [step9-consensus] %s %s (%s): 3 Groq votes "
+                               "did not agree (or any vote was skip)",
+                               pair, direction, strategy)
                 verdict.reason = reason
                 db.record_research(pair, "rejected", reason, checklist.score)
                 return self._finish(verdict, started)
 
             if str(decision.get("decision", "skip")).lower() != direction:
                 reason = f"step9 groq decision={decision.get('decision')}"
+                logger.warning("REJECT [step9-decision] %s %s (%s): Groq voted "
+                               "'%s' conviction=%s vs proposed %s",
+                               pair, direction, strategy, decision.get("decision"),
+                               decision.get("conviction"), direction)
                 verdict.reason = reason
                 db.record_research(pair, "rejected", reason, checklist.score,
                                    int(decision.get("conviction", 0)), {"groq": decision})
@@ -389,11 +413,16 @@ class ResearchEngine:
         if not majority or len(agreeing) < 2:
             return None
         avg_conv = sum(int(r.get("conviction", 0)) for r in agreeing) / len(agreeing)
-        min_conv = settings.GROQ_MIN_CONVICTION
-        if pilot_floor_active and settings.FIRST_TRADE_PILOT_ENABLED:
+        # TEMP window conviction floor supersedes both steady-state and the
+        # first-trade pilot (operator-ordered, auto-expiring)
+        _temp_conv = settings.temp_groq_min_conviction()
+        min_conv = _temp_conv if _temp_conv else settings.GROQ_MIN_CONVICTION
+        if (pilot_floor_active and settings.FIRST_TRADE_PILOT_ENABLED
+                and not _temp_conv):
             min_conv = max(min_conv, settings.FIRST_TRADE_PILOT_CONVICTION)
         if avg_conv < min_conv:
-            logger.info("groq consensus conviction %.0f < %d", avg_conv, min_conv)
+            logger.warning("REJECT [step9-conviction] %s: consensus conviction "
+                           "%.0f < floor %d", pair, avg_conv, min_conv)
             return None
         best = max(agreeing, key=lambda r: int(r.get("conviction", 0)))
         best["_consensus"] = len(agreeing)

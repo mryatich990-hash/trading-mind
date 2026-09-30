@@ -11,6 +11,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 
+from config import settings  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_operator_windows(monkeypatch):
+    """Operator TEMP window + first-trade pilot state live in the repo .env;
+    the suite must test steady state unless a test re-arms them explicitly."""
+    monkeypatch.setattr(settings, "TEMP_WINDOW_STARTED_AT", "")
+    monkeypatch.setattr(settings, "TEMP_MIN_CONFLUENCE", 0)
+    monkeypatch.setattr(settings, "TEMP_GROQ_MIN_CONVICTION", 0)
+    monkeypatch.setattr(settings, "TEMP_GROQ_VERIFY_THRESHOLD", 0)
+    monkeypatch.setattr(settings, "FIRST_TRADE_PILOT_ENABLED", False)
+
 
 @pytest.fixture()
 def temp_db(tmp_path, monkeypatch):

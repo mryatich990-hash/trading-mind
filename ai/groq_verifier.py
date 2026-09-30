@@ -79,6 +79,9 @@ class GroqVerifier:
 
     def verify(self, response: dict, prompt: str) -> VerificationResult:
         """Score factual accuracy of a decision response."""
+        # threshold resolved PER CALL so the operator temp window applies to a
+        # long-lived engine without a restart (falls back to boot value)
+        threshold = settings.effective_groq_verify_threshold()
         decision = str(response.get("decision", "")).lower()
         if decision not in ("buy", "sell", "skip"):
             return VerificationResult(False, 0.0, [], "invalid decision")
@@ -121,9 +124,10 @@ class GroqVerifier:
         score = round((total - len(failed)) / total * 100.0, 1)
         if not failed:
             return VerificationResult(True, score, [], "")
-        if score >= self.threshold:
+        if score >= threshold:
             return VerificationResult(True, score, failed, "")
-        return VerificationResult(False, score, failed, f"score {score:.0f} < {self.threshold}")
+        return VerificationResult(False, score, failed,
+                                  f"score {score:.0f} < {threshold}")
 
     def verified_decision(self, pair: str, prompt: str, max_attempts: int = 3) -> Optional[dict]:
         """ask -> verify -> retry loop; forced skip after consecutive failures."""
@@ -189,4 +193,5 @@ class GroqVerifier:
                 "raw_response) VALUES (:t, :p, :r, :s, :c, :raw)"
             ), {"t": db._utcnow(), "p": pair, "r": reason[:255], "s": score,
                 "c": json.dumps(claims)[:2000], "raw": raw})
-        logger.warning("groq rejected for %s: %s (score %.0f)", pair, reason, score)
+        logger.warning("REJECT [groq-verify] %s: %s (failed claims: %s)",
+                       pair, reason[:120], json.dumps(claims[:2])[:200])

@@ -121,6 +121,65 @@ MAX_CONFLUENCE = env_int("MAX_CONFLUENCE", 10)
 FIRST_TRADE_PILOT_ENABLED = env_bool("FIRST_TRADE_PILOT_ENABLED", False)
 FIRST_TRADE_PILOT_CONFLUENCE = env_int("FIRST_TRADE_PILOT_CONFLUENCE", 7)
 FIRST_TRADE_PILOT_CONVICTION = env_int("FIRST_TRADE_PILOT_CONVICTION", 80)
+
+# ---- TEMPORARY trade-unblock window (operator-ordered, auto-expires) ----
+# One env-controlled window loosens THREE gates at once: confluence floor,
+# Groq conviction floor, Groq verifier score floor, and suppresses all
+# circuit breakers EXCEPT the capital-protection allowlist. Expiry is
+# computed per call from TEMP_WINDOW_STARTED_AT + TEMP_WINDOW_HOURS, so the
+# window ends by itself with no cleanup commit or restart.
+TEMP_WINDOW_HOURS = env_float("TEMP_WINDOW_HOURS", 24.0)
+TEMP_WINDOW_STARTED_AT = env_str("TEMP_WINDOW_STARTED_AT", "")  # ISO UTC
+TEMP_MIN_CONFLUENCE = env_int("TEMP_MIN_CONFLUENCE", 0)   # 0 = inactive
+TEMP_GROQ_MIN_CONVICTION = env_int("TEMP_GROQ_MIN_CONVICTION", 0)
+TEMP_GROQ_VERIFY_THRESHOLD = env_int("TEMP_GROQ_VERIFY_THRESHOLD", 0)
+# breakers that STAY active during the window (capital protection only)
+TEMP_BREAKERS_ALLOWLIST = env_str(
+    "TEMP_BREAKERS_ALLOWLIST", "daily_loss,drawdown_halt,margin_halt")
+
+
+def _temp_window_active() -> bool:
+    """True while the temporary unblock window is live."""
+    if not TEMP_WINDOW_STARTED_AT:
+        return False
+    try:
+        from datetime import datetime, timezone
+
+        start = datetime.fromisoformat(TEMP_WINDOW_STARTED_AT)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+        return 0.0 <= elapsed < TEMP_WINDOW_HOURS * 3600.0
+    except Exception:
+        return False
+
+
+def temp_min_confluence() -> int:
+    """Temporary confluence floor cap (0 = no cap)."""
+    return TEMP_MIN_CONFLUENCE if _temp_window_active() else 0
+
+
+def temp_groq_min_conviction() -> int:
+    """Temporary Groq consensus conviction floor (0 = steady state)."""
+    return TEMP_GROQ_MIN_CONVICTION if _temp_window_active() else 0
+
+
+def temp_groq_verify_threshold() -> int:
+    """Temporary verifier score floor (0 = steady state)."""
+    return TEMP_GROQ_VERIFY_THRESHOLD if _temp_window_active() else 0
+
+
+def effective_groq_verify_threshold() -> int:
+    """Verifier floor actually in force right now."""
+    temp = temp_groq_verify_threshold()
+    return temp if temp else GROQ_VERIFY_THRESHOLD
+
+
+def temp_breaker_allowlist() -> list[str]:
+    """Breakers that remain ACTIVE during the window ([] = window closed)."""
+    if not _temp_window_active():
+        return []
+    return [s.strip() for s in TEMP_BREAKERS_ALLOWLIST.split(",") if s.strip()]
 MAX_DAILY_LOSS_PCT = env_float("MAX_DAILY_LOSS_PCT", 3.0)
 RISK_PER_TRADE_PCT = env_float("RISK_PER_TRADE_PCT", 1.0)
 MAX_RISK_PER_TRADE_PCT = env_float("MAX_RISK_PER_TRADE_PCT", 1.5)

@@ -353,6 +353,20 @@ def api_control() -> tuple:
     return jsonify({"ok": False, "error": "unknown action"}), 400
 
 
+@app.route("/api/force_trade", methods=["POST"])
+def api_force_trade() -> tuple:
+    """Operator-forced end-to-end test trade (EURUSD 0.01 market order).
+
+    Web process only writes the trigger state key; the engine worker picks
+    it up on its next cycle and runs the real risk+execution pipeline.
+    """
+    if (request.json or {}).get("action") != "force_trade":
+        return jsonify({"ok": False, "error": "body must be {action: force_trade}"}), 400
+    db.set_state("force_trade_requested", "1")
+    db.audit("operator", "force_trade_requested", "dashboard endpoint")
+    return jsonify({"ok": True, "detail": "engine will execute within one cycle (~60s)"})
+
+
 def _get_trade_manager():
     """Trade manager instance when the app runs inside the bot process."""
     try:
