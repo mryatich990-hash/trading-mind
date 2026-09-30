@@ -166,6 +166,16 @@ class TestWindowInEngine:
         verdict = eng.evaluate("EURUSD", "buy", "trend_follow", 1.1000,
                                1.0980, 1.1060)
         assert verdict.approved is True
+        assert verdict.confluence == 6  # risk gate reads this; must not be 0
+
+    def test_confluence_always_populated(self, temp_db):
+        """Regression: verdict.confluence stayed 0 forever, so the risk gate
+        rejected every organic approval with 'confluence 0 < required 8'."""
+        eng = _engine(score=7, conviction=90)
+        verdict = eng.evaluate("EURUSD", "buy", "trend_follow", 1.1000,
+                               1.0980, 1.1060)
+        assert verdict.confluence == 7  # set even on the rejection path
+        assert verdict.approved is False  # 7 < 8 floor out of window
 
     def test_below_window_floor_still_rejected(self, temp_db, monkeypatch):
         _arm_window(monkeypatch)
@@ -211,6 +221,31 @@ class TestWindowInEngine:
 # ---------------------------------------------------------------------------
 # verifier floor in window
 # ---------------------------------------------------------------------------
+
+class TestRiskGateWindow:
+    def test_risk_gate_honors_cap(self, temp_db, monkeypatch):
+        """Risk gate check 5 applies the same TEMP cap (5) as research."""
+        from risk.risk_manager import RiskManager
+        _arm_window(monkeypatch)
+        rm = RiskManager()
+        kwargs = dict(entry=1.1000, sl=1.0980, tp=1.1060, balance=10000.0,
+                      equity=10000.0, used_margin=0.0, usdjpy=0.0,
+                      open_positions=[], vix=0.0, spread_pips=1.0,
+                      mode="demo", size_multipliers={})
+        decision = rm.evaluate("EURUSD", "buy", "trend_follow", confluence=5,
+                               **kwargs)
+        assert "confluence" not in decision.reason
+
+    def test_risk_gate_full_floor_outside_window(self, temp_db):
+        from risk.risk_manager import RiskManager
+        rm = RiskManager()
+        decision = rm.evaluate("EURUSD", "buy", "trend_follow", confluence=5,
+                               entry=1.1000, sl=1.0980, tp=1.1060,
+                               balance=10000.0, equity=10000.0,
+                               mode="demo")
+        assert decision.approved is False
+        assert "confluence 5 < required" in decision.reason
+
 
 class TestVerifierWindow:
     def test_low_score_accepted_in_window(self, monkeypatch):

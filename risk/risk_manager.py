@@ -162,7 +162,16 @@ class RiskManager:
                                       checks=checks)
 
             # 5. confluence requirement from drawdown tier
-            if confluence < dd.min_confluence:
+            # TEMP window: the operator cap applies here too (same window as
+            # the research-side cap; auto-expires with it)
+            _required = dd.min_confluence
+            _cap = settings.temp_min_confluence()
+            if _cap:
+                _required = min(_required, _cap)
+            if confluence < _required:
+                return SizingDecision(
+                    False, f"confluence {confluence} < required {_required}",
+                    checks=checks)
                 return SizingDecision(
                     False, f"confluence {confluence} < required {dd.min_confluence}",
                     checks=checks)

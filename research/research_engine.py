@@ -241,6 +241,7 @@ class ResearchEngine:
             checklist = self.validator.validate(pair, direction, frames, htf, macro,
                                                 confluence_bonus=bonus)
             verdict.checklist = checklist
+            verdict.confluence = checklist.score  # was never set: risk gate saw 0!
             verdict.required_confluence = max(
                 settings.MIN_CONFLUENCE, hist.required_confluence,
                 9 if checklist.required >= 9 else 8)
