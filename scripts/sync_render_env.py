@@ -80,17 +80,23 @@ existing = {e["envVar"]["key"]: e["envVar"]["value"]
             for e in _get_all_env_vars()}
 
 add = {}
+update = {}  # keys that exist remotely but with a DIFFERENT local value
 for k, v in local.items():
-    if k in SKIP or k in existing or any(k.startswith(p) for p in PREFIX_SKIP):
+    if k in SKIP or any(k.startswith(p) for p in PREFIX_SKIP):
+        continue
+    if k in existing:
+        if existing[k] != v:
+            update[k] = v  # value drift must propagate, not be skipped
         continue
     add[k] = v
 
-if not add:
+if not add and not update:
     print("nothing to sync")
     sys.exit(0)
 
 merged = dict(existing)
 merged.update(add)
+merged.update(update)
 
 # Render expects a BARE ARRAY of {key, value}; the old {"envVars": [...]} wrapper
 # was rejected with "invalid JSON" while the script printed success anyway.
