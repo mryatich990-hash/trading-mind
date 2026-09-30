@@ -28,7 +28,7 @@ logger = get_logger(__name__)
 
 __all__ = ["ExecutionEngine"]
 
-MARKET_ORDER_STRATEGIES = {"news_spike_fade"}
+MARKET_ORDER_STRATEGIES = {"news_spike_fade", "forced_test_trade"}
 
 
 class ExecutionEngine:
@@ -120,6 +120,13 @@ class ExecutionEngine:
                     fill = self._market_fill(broker, verdict, lots_f)
                 else:
                     fill = self._limit_fill(broker, verdict, lots_f)
+            if fill.get("deferred"):
+                # limit zone not reached yet: NO trade row (a deferred fill is
+                # not a position — recording one creates phantom open trades
+                # that manage/monitor logic would try to track forever)
+                logger.info("limit fill deferred for %s at %.5f; no trade row",
+                            verdict.pair, verdict.entry)
+                return None
         except BrokerError as exc:
             logger.error("MT5 execution failed: %s", exc)
             try:

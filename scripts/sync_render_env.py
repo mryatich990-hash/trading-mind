@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 SERVICE = "srv-dasmij8jo6nc73cf1ob0"
 TOKEN = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -52,9 +53,31 @@ def api(method, path, payload=None):
     return json.loads(out.stdout) if out.stdout.strip() else {}
 
 
+def _get_all_env_vars() -> list[dict]:
+    """GET env-vars with pagination (Render defaults to 20-item pages, which
+    made full sets LOOK like silent PUT failures)."""
+    out: list[dict] = []
+    cursor: Optional[str] = None
+    while True:
+        path = f"/services/{SERVICE}/env-vars?limit=100"
+        if cursor:
+            path += f"&cursor={cursor}"
+        page = api("GET", path)
+        if not isinstance(page, list):
+            break
+        out.extend(page)
+        cursor = page[-1].get("cursor") if page else None
+        if not cursor or not page:
+            break
+    return out
+
+
 local = load_env(ENV_FILE)
+# NOTE: full pagination — a single GET returns one 20-item page, and a merge
+# against one page silently DROPPED server-side-only keys (DATABASE_URL) on
+# the next replace-all PUT.
 existing = {e["envVar"]["key"]: e["envVar"]["value"]
-            for e in api("GET", f"/services/{SERVICE}/env-vars")}
+            for e in _get_all_env_vars()}
 
 add = {}
 for k, v in local.items():
@@ -68,9 +91,74 @@ if not add:
 
 merged = dict(existing)
 merged.update(add)
-payload = {"envVars": [{"key": k, "value": v} for k, v in merged.items()]}
-api("PUT", f"/services/{SERVICE}/env-vars", payload)
-print(f"synced {len(add)} keys to Render (total {len(merged)}). Added:")
+
+# Render expects a BARE ARRAY of {key, value}; the old {"envVars": [...]} wrapper
+# was rejected with "invalid JSON" while the script printed success anyway.
+# The GET side defaults to 20-item pages, which made full sets LOOK like they
+# failed to land; verification is paginated (see _get_all_env_vars above).
+
+
+def verify(expected: set[str]) -> list[str]:
+    """Re-GET env vars (paginated); return expected keys NOT live."""
+    live = {e["envVar"]["key"] for e in _get_all_env_vars()}
+    return sorted(expected - live)
+
+
+def chunked_put(items: list[dict], chunk_size: int = 12) -> None:
+    """Cumulative-chunk PUT with adaptive shrink.
+
+    Each PUT is replace-all, so every chunk must be a SUPERSET of the last.
+    Render silently drops large PUTs (200 OK, nothing lands), so after each
+    PUT we verify; on a partial landing the chunk SHRINKS and retries the
+    same frontier until it verifies (floor: single key -> hard error).
+    """
+    keys = [i["key"] for i in items]
+    done = 0
+    take = chunk_size
+    n = 0
+    # first try the whole set in ONE put (works fine; the 20-item 'cap' was
+    # a pagination mirage in the old verification code)
+    res = api("PUT", f"/services/{SERVICE}/env-vars", items)
+    if isinstance(res, dict) and res.get("message"):
+        raise RuntimeError(f"PUT rejected: {res['message']}")
+    time.sleep(4)
+    missing = verify({i["key"] for i in items})
+    if not missing:
+        print(f"  single PUT: all {len(items)} keys verified live")
+        return
+    print(f"  single PUT incomplete ({len(missing)} missing); "
+          "falling back to adaptive chunks")
+    while done < len(items):
+        n += 1
+        take = max(1, min(take, len(items) - done))
+        upto = done + take
+        subset = items[:upto]
+        res = api("PUT", f"/services/{SERVICE}/env-vars", subset)
+        if isinstance(res, dict) and res.get("message"):
+            raise RuntimeError(f"chunk PUT rejected: {res['message']} "
+                               f"(keys {keys[done]}..{keys[upto - 1]})")
+        time.sleep(3)  # let the env-var write settle before verification
+        missing = verify({i["key"] for i in subset})
+        if missing:
+            if take == 1:
+                raise RuntimeError(f"single key refuses to land: {keys[done]} "
+                                   f"(check value format/length)")
+            take = max(1, take // 2)  # shrink and retry the same frontier
+            print(f"  chunk {n}: partial landing, shrinking to {take} "
+                  f"(missing e.g. {missing[0]})")
+            continue
+        print(f"  chunk {n}: {upto}/{len(items)} keys verified live (take={take})")
+        done = upto
+
+
+chunked_put([{"key": k, "value": v} for k, v in merged.items()])
+final_missing = verify(set(merged))
+if final_missing:
+    print(f"FINAL CHECK INCOMPLETE: {final_missing}", file=sys.stderr)
+    sys.exit(1)
+print(f"VERIFIED {len(merged)} keys live on Render")
+
+print(f"synced {len(add)} keys to Render. Added:")
 for k in sorted(add):
     v = add[k]
     show = f"<set:{len(v)}>" if any(s in k for s in ("KEY", "TOKEN", "SECRET", "PASSWORD")) else v[:40]

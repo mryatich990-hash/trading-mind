@@ -98,7 +98,13 @@ class TradingSystem:
         self.oanda = OandaConnector()
 
         self.notifier = make_bot()
-        self.execution = ExecutionEngine(mode="demo" if settings.DEMO_MODE else "live",
+        # paper broker gets the data engine so it can PRICE orders: without
+        # it the final fallback in the broker chain is a dead end on hosts
+        # with no MT5/OANDA/cTrader credentials (local + Render)
+        from execution.paper_broker import PaperBroker
+        paper = PaperBroker(data_engine=self.data)
+        self.execution = ExecutionEngine(paper=paper,
+                                         mode="demo" if settings.DEMO_MODE else "live",
                                          notifier=self.notifier.send)
         self.trade_manager = TradeManager(broker=self._active_broker_or_none(),
                                           notifier=self.notifier.send,
