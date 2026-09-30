@@ -41,27 +41,37 @@ class TelegramBot:
     # ---- low level ----
 
     def _call(self, method: str, payload: Optional[dict] = None,
-              retries: int = 3) -> Optional[dict]:
+              retries: int = 3, read_timeout: int = 15) -> Optional[dict]:
         """Telegram API call with exponential backoff; None on failure.
 
         Deterministic 4xx errors (400 bad payload, 401 bad token) are not
-        retried: only 429/5xx/network errors benefit from backoff.
+        retried: only 429/5xx/network errors benefit from backoff. The read
+        timeout must EXCEED any long-poll "timeout" in the payload, or the
+        client gives up before Telegram answers (getUpdates was timing out
+        every ~22s with a 25s poll window and a 15s read timeout).
         """
         if not self.token:
             return None
         for attempt in range(1, retries + 1):
             try:
                 resp = self.session.post(API.format(token=self.token, method=method),
-                                         json=payload or {}, timeout=15)
+                                         json=payload or {},
+                                         timeout=(10, read_timeout + 10))
                 resp.raise_for_status()
                 return resp.json()
             except requests.HTTPError as exc:
                 status = getattr(exc.response, "status_code", 0)
+                body = ""
+                try:
+                    body = str(exc.response.json().get("description", ""))[:160]
+                except Exception:
+                    body = str(exc)[:160]
                 if 400 <= status < 500 and status != 429:
                     logger.warning("telegram %s failed (permanent %d): %s",
-                                   method, status, str(exc)[:120])
+                                   method, status, body)
                     return None
-                logger.warning("telegram %s attempt %d failed: %s", method, attempt, exc)
+                logger.warning("telegram %s attempt %d failed: %s %s",
+                               method, attempt, exc, body)
                 time.sleep(2 ** attempt)
             except Exception as exc:
                 logger.warning("telegram %s attempt %d failed: %s", method, attempt, exc)
@@ -75,21 +85,19 @@ class TelegramBot:
     # ---- alerts ----
 
     def send(self, text: str, chat_id: Optional[str] = None) -> bool:
-        """Send a message; returns success.
+        """Send a message as PLAIN TEXT; returns success.
 
-        HTML parse_mode first; on Telegram 400 (unbalanced tags, stray
-        <>& in dynamic text) retry once as plain text so critical alerts
-        like the first-trade notification are never swallowed.
+        parse_mode=HTML was removed: dynamic alert text (prices, breaker
+        reasons, '<' in comparisons) kept tripping Telegram's HTML parser
+        with permanent 400s. Plain text accepts any content and no alert
+        template uses HTML tags anyway.
         """
         target = chat_id or self.chat_id
         if not self.token or not target:
             logger.info("telegram (no config): %s", text[:200])
             return False
-        data = self._call("sendMessage", {"chat_id": target, "text": text[:4000],
-                                          "parse_mode": "HTML"})
-        if not (data and data.get("ok")):
-            data = self._call("sendMessage", {"chat_id": target,
-                                              "text": text[:4000]})
+        data = self._call("sendMessage", {"chat_id": target,
+                                          "text": text[:4000]})
         return bool(data and data.get("ok"))
 
     # ---- command registration ----
@@ -118,7 +126,9 @@ class TelegramBot:
         """Long-poll getUpdates and dispatch commands."""
         offset = 0
         while self._running:
-            data = self._call("getUpdates", {"offset": offset, "timeout": 25}, retries=1)
+            # long-poll window 25s -> read timeout must exceed it (40s)
+            data = self._call("getUpdates", {"offset": offset, "timeout": 25},
+                              retries=1, read_timeout=40)
             if not data:
                 time.sleep(5)
                 continue
