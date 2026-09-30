@@ -159,8 +159,10 @@ class ExecutionEngine:
                  f"{verdict.pair} {verdict.direction} {lots_f} lots @ {fill['price']:.5f} "
                  f"slippage {slippage_pips:.1f} pips", source="execution_engine")
         self._mirror_shadow(trade_id, verdict, fill["price"], intended)
+        counts = db.trade_counts(self.mode)
         self._notify(
             f"▶ {verdict.pair} {verdict.direction.upper()}\n"
+            f"Trade #{counts['all_time']} ({counts['today']} today)\n"
             f"Entry: {fill['price']:.5f} | SL: {verdict.sl:.5f} | TP1: {verdict.tp1:.5f} | "
             f"TP2: {verdict.tp2:.5f}\n"
             f"Conviction: {verdict.conviction}% | Strategy: {strategy}\n"

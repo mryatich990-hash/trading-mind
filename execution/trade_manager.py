@@ -283,8 +283,10 @@ class TradeManager:
             logger.warning("broker close failed #%d (already closed?): %s", trade_id, exc)
         db.close_trade(trade_id, exit_price, round(pips, 1), round(pnl, 2), round(rr, 2))
         self._record_slippage(trade_id, exit_price)
+        counts = db.trade_counts(trade.get("mode"))
         self._notify(
             f"⏹ {pair} {direction.upper()} CLOSED\n"
+            f"Trade #{counts['all_time']} ({counts['today']} today)\n"
             f"{entry:.5f} → {exit_price:.5f}\n"
             f"Result: {pips:+.1f} pips | ${pnl:+.2f}\n"
             f"Reason: {reason}\n"

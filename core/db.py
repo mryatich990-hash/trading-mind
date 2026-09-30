@@ -24,6 +24,7 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 _WRITE_LOCK = threading.RLock()
 _INITIALIZED = False
+_LAST_TRADE_COUNTS = {"today": 0, "all_time": 0}
 
 
 def _utcnow() -> datetime:
@@ -349,6 +350,35 @@ def daily_pnl(mode: Optional[str] = None) -> float:
     """Sum of today's closed PnL."""
     rows = trades_today(mode)
     return round(sum(float(r["pnl_usd"] or 0) for r in rows if r["status"] == "closed"), 2)
+
+
+def trade_counts(mode: Optional[str] = None) -> dict:
+    """Trade counters for notifications: {'today': N, 'all_time': M}.
+
+    Fail-safe: on any DB error returns the last known values (zeros on the
+    first failure) so a counting hiccup never breaks an alert.
+    """
+    global _LAST_TRADE_COUNTS
+    try:
+        day = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        sql = "SELECT COUNT(*) AS n, CASE WHEN created_at >= :d THEN 1 ELSE 0 END AS is_today FROM trades"
+        params: dict[str, Any] = {"d": day}
+        if mode:
+            sql += " WHERE mode = :m"
+            params["m"] = mode
+        with _session() as s:
+            rows = s.execute(text(_fix(sql)), params).mappings().all()
+        counts = {"today": 0, "all_time": 0}
+        for row in rows:
+            n = int(row["n"] or 0)
+            counts["all_time"] += n
+            if int(row["is_today"] or 0):
+                counts["today"] += n
+        _LAST_TRADE_COUNTS = counts
+        return counts
+    except Exception:
+        logger.exception("trade_counts query failed (using last known values)")
+        return dict(_LAST_TRADE_COUNTS)
 
 
 def record_research(pair: str, result: str, reason: str, confluence: int = 0,
