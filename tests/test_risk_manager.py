@@ -77,8 +77,9 @@ class TestRiskGate:
         assert "halted" in decision.reason
 
     def test_rejects_max_open_trades(self, temp_db):
+        from config import settings
         from core import db
-        for i in range(2):
+        for i in range(settings.MAX_OPEN_TRADES):
             db.record_trade("GBPUSD", "buy", 0.1, 1.2500, 1.2450, 1.2600,
                             strategy="ema_trend_rider", signal_hash=f"open{i}",
                             mode="demo")
@@ -89,8 +90,9 @@ class TestRiskGate:
         assert "max open" in decision.reason
 
     def test_rejects_max_trades_per_day(self, temp_db):
+        from config import settings
         from core import db
-        for i in range(8):
+        for i in range(settings.MAX_TRADES_PER_DAY):
             db.record_trade("GBPUSD", "buy", 0.1, 1.2500, 1.2450, 1.2600,
                             strategy="ema_trend_rider", signal_hash=f"t{i}",
                             mode="demo")

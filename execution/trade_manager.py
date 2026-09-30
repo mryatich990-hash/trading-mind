@@ -272,7 +272,13 @@ class TradeManager:
             rr = ((exit_price - entry) if direction == "buy"
                   else (entry - exit_price)) / risk
         try:
-            self.broker.close_position(int(trade.get("ticket", trade_id)))
+            closed_ticket = None
+            if hasattr(self.broker, "close_matching"):
+                # ticket-agnostic: the trades row has no ticket column, so
+                # match on pair+direction (oldest open paper position)
+                closed_ticket = self.broker.close_matching(pair, direction)
+            if closed_ticket is None:
+                self.broker.close_position(int(trade.get("ticket", trade_id)))
         except Exception as exc:
             logger.warning("broker close failed #%d (already closed?): %s", trade_id, exc)
         db.close_trade(trade_id, exit_price, round(pips, 1), round(pnl, 2), round(rr, 2))

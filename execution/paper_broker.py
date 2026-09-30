@@ -170,6 +170,24 @@ class PaperBroker:
                     ticket, pair, direction, lots, fill, sl, tp, comment)
         return ticket
 
+    def close_matching(self, pair: str, direction: str) -> Optional[int]:
+        """Close the OLDEST open position matching pair+direction; return its
+        ticket (or None if no match).
+
+        Ticket-agnostic reconciliation: the trades table has no ticket
+        column, so callers cannot reliably map a trade row to its paper
+        ticket (the old id-fallback closed nonexistent tickets and P&L was
+        never settled into the balance).
+        """
+        pair = pair.upper()
+        with self._lock:
+            for ticket in sorted(self._positions):
+                p = self._positions[ticket]
+                if p["pair"] == pair and p["direction"] == direction:
+                    self.close_position(ticket)
+                    return ticket
+        return None
+
     def close_position(self, ticket: int, lots: Optional[float] = None) -> bool:
         """Close full or partial; realizes PnL into the virtual balance."""
         with self._lock:
