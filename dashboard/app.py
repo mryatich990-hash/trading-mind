@@ -75,10 +75,33 @@ def webhook_tv() -> tuple[str, int]:
 # ---- section APIs ----
 
 
+def _engine_alive_by_heartbeat() -> bool:
+    """True when the engine heartbeat is < 5 minutes old.
+
+    Same contract as /health (health.py): the supervisor rewrites
+    engine_heartbeat every 30s, so a fresh beat is proof of life. The old
+    `running` flag could lag reality for hours (e.g. after an overnight
+    feed-observation boot) and made the dashboard show OFFLINE while the
+    engine traded — the flag is now only a fallback.
+    """
+    try:
+        ts = db.get_state("engine_heartbeat", "")
+        if not ts:
+            return False
+        beat = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if beat.tzinfo is None:
+            beat = beat.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - beat).total_seconds()
+        return age < 300
+    except (ValueError, TypeError):
+        return False
+
+
 @app.route("/api/status")
 def api_status() -> tuple:
     """Section 1: status bar + section 2: account overview."""
-    running = db.get_state("running", "0") == "1"
+    running = db.get_state("running", "0") == "1" \
+        or _engine_alive_by_heartbeat()
     paused = db.get_state("trading_paused", "0") == "1"
     breakers = db.unresolved_breakers()
     mode = db.get_state("trade_mode", "demo")
