@@ -408,6 +408,8 @@ class MarketDataEngine:
         self.healthy_since: Optional[float] = None
         self._latencies: list[float] = []
         self._cache: dict[str, CandleData] = {}
+        # throttle map for repeated failure logs / health rows (see _throttled)
+        self._warn_dedupe: dict[str, float] = {}
 
     # ---- status (consumed by AutoRecovery + /health) ----
 
@@ -544,12 +546,22 @@ class MarketDataEngine:
                 return candle
             except Exception as exc:
                 errors.append(f"{feed.name}: {exc}")
-                logger.warning("feed %s failed %s %dm: %s", feed.name, pair, timeframe_min, exc)
+                # identical failures repeat every engine cycle: a 7x-ATR gold
+                # spike failed validation for the full ~10-min yfinance lag
+                # and produced ~120 identical lines + rows, pushing everything
+                # else out of the log window. Log each feed/pair/timeframe
+                # failure at most once per 2 minutes.
+                self._warn_once(f"{feed.name}|{pair}|{timeframe_min}", 120.0,
+                                "feed %s failed %s %dm: %s",
+                                feed.name, pair, timeframe_min, exc)
                 if time.monotonic() >= deadline:
                     break
         self.consecutive_failures += 1
         self._record_check(False)
-        db.log_feed_health("data_feeds", False, "; ".join(errors)[:255])
+        # throttle failure rows to one per pair/timeframe per minute (the
+        # same episode also wrote ~120 feed_health rows into Supabase)
+        if self._throttled(f"health|{pair}|{timeframe_min}", 60.0):
+            db.log_feed_health("data_feeds", False, "; ".join(errors)[:255])
         cached = self._cache.get(f"{pair}_{timeframe_min}_{count}")
         if cached is not None:
             return cached
@@ -577,6 +589,25 @@ class MarketDataEngine:
         avg = sum(self._latencies) / len(self._latencies)
         if avg > 3.0 and len(self._latencies) >= 10:
             logger.error("feed latency high: %.2fs average", avg)
+
+    def _throttled(self, key: str, window_sec: float) -> bool:
+        """True the first time `key` is seen within window_sec (records it).
+
+        Bounded by distinct feed/pair/timeframe combos, so the map cannot
+        grow unbounded even with error messages that change every cycle
+        (e.g. stale-age strings).
+        """
+        now = time.monotonic()
+        if now - self._warn_dedupe.get(key, 0.0) < window_sec:
+            return False
+        self._warn_dedupe[key] = now
+        return True
+
+    def _warn_once(self, key: str, window_sec: float,
+                   message: str, *args) -> None:
+        """logger.warning, but at most once per window per key."""
+        if self._throttled(key, window_sec):
+            logger.warning(message, *args)
 
     def get_price(self, pair: str) -> dict:
         """Latest bid/ask approximation from the last candle."""

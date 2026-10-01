@@ -306,3 +306,43 @@ class TestMirrorRetry:
             (100.0, 110.0, 80.0)
         # degenerate levels pass through untouched
         assert ResearchEngine._mirror_prices(0.0, 0.0, 0.0, "buy") == (0.0, 0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# failure log/health-row throttling (gold 7x-ATR spike episode, 2026-10-01)
+# ---------------------------------------------------------------------------
+
+class _BoomFeed:
+    """Feed that always fails with the same validation-style error."""
+
+    name = "boom"
+    configured = True
+
+    def fetch(self, pair, timeframe_min, count):
+        raise RuntimeError("candle anomaly: range 14.80029 > 5x ATR 2.12212")
+
+
+class TestFailureSpamThrottle:
+    def test_repeated_failure_logged_once_per_window(self, temp_db, caplog):
+        """The gold-spike episode logged the SAME warning every ~6s for ~12
+        minutes (~120 lines) and wrote ~120 feed_health rows. Each feed/pair/
+        timeframe failure must now log once per 2 min and write one health
+        row per minute."""
+        import logging
+
+        eng = MarketDataEngine(feeds=[_BoomFeed()], failover_deadline_sec=0.1)
+        with caplog.at_level(logging.WARNING, logger="data.market_data_engine"):
+            for _ in range(5):
+                with pytest.raises(Exception):
+                    eng.get_candles("XAUUSD", 1, 50)
+        warns = [r for r in caplog.records
+                 if "feed boom failed" in r.getMessage()]
+        assert len(warns) == 1  # 5 failures -> exactly 1 warning line
+
+    def test_throttled_key_repeats_after_window(self, temp_db, monkeypatch):
+        eng = MarketDataEngine(feeds=[_BoomFeed()], failover_deadline_sec=0.1)
+        assert eng._throttled("k", 60.0) is True   # first seen -> allowed
+        assert eng._throttled("k", 60.0) is False  # inside window -> blocked
+        # simulate window expiry
+        eng._warn_dedupe["k"] -= 61.0
+        assert eng._throttled("k", 60.0) is True
