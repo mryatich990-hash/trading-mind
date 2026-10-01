@@ -190,6 +190,11 @@ MAX_TRADES_PER_DAY = env_int("MAX_TRADES_PER_DAY", 8)
 MIN_ACCOUNT_BALANCE = env_float("MIN_ACCOUNT_BALANCE", 50.0)
 KELLY_CAP_PCT = env_float("KELLY_CAP_PCT", 1.5)
 KELLY_FLOOR_PCT = env_float("KELLY_FLOOR_PCT", 0.25)
+# Absolute per-trade lots cap regardless of risk math. A tiny SL (e.g. Groq
+# returning a 2-4 pip stop) otherwise explodes lots_for_risk into 1.5-30 lot
+# trades ($250k+ notional on a $10k account). 0.75 lots at the worst observed
+# 2-pip SL loses ~1.4% — still inside MAX_RISK_PER_TRADE_PCT.
+MAX_ABS_LOTS = env_float("MAX_ABS_LOTS", 0.75)
 
 # ---- selector ----
 SELECTOR_MIN_SCORE = env_int("SELECTOR_MIN_SCORE", 70)

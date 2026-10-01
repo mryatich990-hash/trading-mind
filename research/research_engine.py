@@ -324,8 +324,17 @@ class ResearchEngine:
             verdict.consensus_size = FULL_SIZE if decision.get("_consensus") == 3 \
                 else REDUCED_65
 
-            # prices: Groq SL/TP preferred when sane, strategy levels as fallback
-            verdict.sl = self._price_or_zero(decision.get("sl")) or signal_sl
+            # prices: Groq SL/TP accepted only when NOT tighter than the
+            # strategy's structural stop. Groq supplied a 4.4-pip SL on the
+            # 15:03 EURJPY trade (structural stop ~12 pips) and risk-denominated
+            # sizing then exploded into 1.55 lots. Wider Groq SLs are still
+            # accepted (looser stop = less size, saner risk).
+            groq_sl = self._price_or_zero(decision.get("sl"))
+            if groq_sl and self._sl_at_least_as_wide(groq_sl, signal_sl,
+                                                     verdict.entry, direction):
+                verdict.sl = groq_sl
+            else:
+                verdict.sl = signal_sl
             verdict.tp1 = self._price_or_zero(decision.get("tp1")) or signal_tp
             risk = abs(verdict.entry - verdict.sl)
             verdict.tp2 = self._price_or_zero(decision.get("tp2")) or \
@@ -436,6 +445,29 @@ class ResearchEngine:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    @staticmethod
+    def _sl_at_least_as_wide(groq_sl: float, signal_sl: float,
+                             entry: float, direction: str) -> bool:
+        """True when groq_sl is at least as far from entry as signal_sl.
+
+        A Groq stop TIGHTER than the structural stop must never be used:
+        risk-denominated sizing divides by SL distance, so a 2-4 pip stop
+        explodes position size (EURJPY #4: 1.55 lots from a 4.4-pip SL).
+        Wider (looser) Groq stops are accepted. Also rejects stops on the
+        wrong side of entry entirely.
+        """
+        if groq_sl <= 0 or signal_sl <= 0 or entry <= 0:
+            return False
+        if direction == "buy":
+            if groq_sl >= entry or signal_sl >= entry:
+                return False
+            return (entry - groq_sl) >= (entry - signal_sl)
+        if direction == "sell":
+            if groq_sl <= entry or signal_sl <= entry:
+                return False
+            return (groq_sl - entry) >= (signal_sl - entry)
+        return False
 
     def _finish(self, verdict: ResearchVerdict, started: float) -> ResearchVerdict:
         """Stamp duration and log."""

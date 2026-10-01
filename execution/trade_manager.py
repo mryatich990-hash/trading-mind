@@ -23,6 +23,7 @@ from core import db
 from core.logging_utils import get_logger
 from core.event_bus import bus, EventType
 from execution.mt5_connector import MT5Connector
+from execution.pip_math import pip_value_usd
 from research.research_engine import ResearchVerdict
 
 logger = get_logger(__name__)
@@ -264,7 +265,9 @@ class TradeManager:
         entry = float(trade["entry_price"])
         pip = _pip(pair)
         pips = ((exit_price - entry) if direction == "buy" else (entry - exit_price)) / pip
-        pip_value = 10.0 if pair.upper() not in ("USDJPY",) else 6.8
+        # match PaperBroker PIP_VALUE: JPY-quoted pairs are ~6.8 USD/pip/lot,
+        # not 10. Mismatch overstated EURJPY close P&L by ~40% in the DB/alerts.
+        pip_value = pip_value_usd(pair)
         pnl = pips * pip_value * float(trade["lots"])
         rr = 0.0
         risk = abs(entry - float(trade["sl"]))

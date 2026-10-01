@@ -22,34 +22,17 @@ from typing import Optional
 from config import settings
 from core import db
 from core.logging_utils import get_logger
+from execution.pip_math import pip_size as _pip
+from execution.pip_math import pip_value_usd as _pip_value
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["PaperBroker"]
 
-PIP = {"JPY": 0.01, "XAUUSD": 0.1, "NAS100": 1.0, "US30": 1.0}
-PIP_VALUE = {"JPY": 6.8}  # USD value per pip per lot; others 10.0
 SPREAD_PIPS = {"EURUSD": 1.0, "GBPUSD": 1.3, "USDJPY": 1.2, "USDCHF": 1.5,
                "AUDUSD": 1.4, "GBPJPY": 2.5, "EURJPY": 2.0, "XAUUSD": 3.0,
                "NAS100": 2.0, "US30": 3.0}
 UNIT_SIZE = {"XAUUSD": 100.0, "NAS100": 1.0, "US30": 1.0}  # units per lot
-
-
-def _pip(pair: str) -> float:
-    """Pip size for a pair."""
-    pair = pair.upper()
-    for key, value in PIP.items():
-        if key in pair:
-            return value
-    return 0.0001
-
-
-def _pip_value(pair: str) -> float:
-    """USD per pip per 1.0 lot."""
-    for key, value in PIP_VALUE.items():
-        if key in pair.upper():
-            return value
-    return 10.0
 
 
 class PaperBroker:

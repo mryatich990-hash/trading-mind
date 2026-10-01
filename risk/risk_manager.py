@@ -26,22 +26,37 @@ logger = get_logger(__name__)
 
 __all__ = ["SizingDecision", "RiskManager", "lots_for_risk", "signal_hash"]
 
-# pip value in USD per 1.0 standard lot (approximations; USDJPY is dynamic)
+# pip value in USD per 1.0 standard lot (static approximations, matched to
+# PaperBroker.PIP_VALUE so sizing and realized P&L agree; JPY crosses ~6.8)
 PIP_VALUE_PER_LOT = {"EURUSD": 10.0, "GBPUSD": 10.0, "USDJPY": 6.8, "XAUUSD": 10.0,
-                     "NAS100": 1.0, "US30": 1.0}
+                     "NAS100": 1.0, "US30": 1.0, "EURJPY": 6.8, "GBPJPY": 6.8}
 
 
 def lots_for_risk(balance: float, risk_pct: float, sl_pips: float, pair: str,
                   usdjpy: float = 0.0) -> Decimal:
-    """Position lots so that SL hit loses exactly risk_pct of balance (Decimal math)."""
+    """Position lots so that SL hit loses exactly risk_pct of balance (Decimal math).
+
+    Clamped to settings.MAX_ABS_LOTS: risk-denominated sizing on a tiny SL
+    (2-4 pips) otherwise produces 1.5-30 lot trades. When clamped, a hard SL
+    hit loses less than risk_pct of balance — the cap can only undershoot,
+    never overshoot, the intended risk.
+    """
     if sl_pips <= 0 or balance <= 0:
         return Decimal("0.01")
-    pip_value = PIP_VALUE_PER_LOT.get(pair.upper(), 10.0)
-    if pair.upper() == "USDJPY" and usdjpy > 0:
-        pip_value = 1000.0 / usdjpy
+    pair = pair.upper()
+    # same static value PaperBroker credits at close -> SL hit loses exactly
+    # risk_pct of balance in the paper account (no sizing/P&L drift)
+    pip_value = PIP_VALUE_PER_LOT.get(pair, 10.0)
     risk_amount = Decimal(str(balance)) * Decimal(str(risk_pct)) / Decimal("100")
     raw = risk_amount / (Decimal(str(sl_pips)) * Decimal(str(pip_value)))
     lots = raw.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    cap = Decimal(str(settings.MAX_ABS_LOTS)).quantize(Decimal("0.01"),
+                                                       rounding=ROUND_HALF_UP)
+    if lots > cap:
+        logger.warning("lots_for_risk: %.2f lots exceeds MAX_ABS_LOTS %.2f "
+                       "(sl_pips=%.1f, %.2f%% risk) -> clamped",
+                       float(lots), float(cap), sl_pips, risk_pct)
+        lots = cap
     return max(lots, Decimal("0.01"))
 
 
