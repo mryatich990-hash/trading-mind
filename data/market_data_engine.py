@@ -65,6 +65,20 @@ def fx_market_closed(now: Optional[datetime] = None) -> bool:
             or (weekday == 6 and hour < 21))
 
 
+def freshness_limit_sec(timeframe_min: int) -> float:
+    """Max age (seconds) of the last candle before data counts as stale.
+
+    Sub-15m bars get a 16-minute floor: Yahoo streams FX spot with minutes
+    of lag and quiet-session candle ages routinely pass the old 10-minute
+    floor (STALENESS_LIMIT_SEC), which logged healthy-but-slow data as feed
+    failures (~30% of checks) and dragged the stability breaker into
+    observation — the engine then refused to trade for whole sessions.
+    """
+    if timeframe_min < 15:
+        return max(settings.STALENESS_LIMIT_SEC, 16 * 60)
+    return max(settings.STALENESS_LIMIT_SEC, timeframe_min * 60 * 2)
+
+
 def validate_ohlcv(df: pd.DataFrame, pair: str, max_age_sec: float,
                    timeframe_min: int = 15) -> Optional[str]:
     """Validate candles: freshness, OHLC logic, volume, freeze, anomalies."""
@@ -85,13 +99,17 @@ def validate_ohlcv(df: pd.DataFrame, pair: str, max_age_sec: float,
         return "zero volume on recent candles"
     if np.any(~np.isfinite(o)) or np.any(~np.isfinite(h)) or np.any(~np.isfinite(l)) or np.any(~np.isfinite(c)):
         return "NaN/inf in OHLC"
-    # data freeze: identical consecutive candles (expected while closed).
-    # Sub-15m bars need a longer run: three quiet 1m minutes on EURUSD are
-    # normal and must not look like a frozen feed.
-    freeze_run = 5 if timeframe_min < 15 else 3
-    closes_tail = df["close"].tail(freeze_run).to_numpy(float)
-    if len(set(closes_tail.tolist())) == 1 and not market_closed:
-        return "data freeze detected"
+    freeze_run = 5
+    # data freeze: identical consecutive closes (expected while closed).
+    # Only checked on sub-15m bars: a genuine feed freeze stops timestamps
+    # from advancing and is caught by the staleness check above anyway, while
+    # quiet-session 15m candles from Yahoo's lag zone legitimately come back
+    # flat — that pattern produced ~50 false "data freeze detected" failures
+    # per day and starved the breaker's stability window.
+    if timeframe_min < 15 and not market_closed:
+        closes_tail = df["close"].tail(freeze_run).to_numpy(float)
+        if len(set(closes_tail.tolist())) == 1:
+            return "data freeze detected"
     # anomaly: candle range > 5x 20-period average ATR
     from data.indicator_engine import atr
     if len(df) > 25:
@@ -468,15 +486,7 @@ class MarketDataEngine:
         """
         deadline = time.monotonic() + self.failover_deadline_sec
         errors: list[str] = []
-        # Yahoo streams 1m/5m FUTURES candles with a ~10-minute delay; a
-        # strict 2-candle freshness floor made XAUUSD 1m fail forever
-        # (~10.5 min lag vs 600s limit), which kept the stability clock from
-        # ever accumulating and wedged the breaker machine in halt limbo.
-        # Cap: a sub-15m candle older than 15 min is genuinely dead.
-        if timeframe_min < 15:
-            freshness = max(settings.STALENESS_LIMIT_SEC, 15 * 60)
-        else:
-            freshness = max(settings.STALENESS_LIMIT_SEC, timeframe_min * 60 * 2)
+        freshness = freshness_limit_sec(timeframe_min)
         previous_source = self.active_feed
         if not probe:
             # key includes count: callers requesting different row counts must

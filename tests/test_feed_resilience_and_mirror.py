@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from data.market_data_engine import CandleData, MarketDataEngine
+from data.market_data_engine import (CandleData, MarketDataEngine,
+                                     freshness_limit_sec, validate_ohlcv)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,51 @@ class TestProbeBypass:
         eng.get_candles("EURUSD", 15, 60)          # populates cache
         eng.get_candles("EURUSD", 15, 60, probe=True)
         assert len(feed.calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# validator: quiet-session flat 15m candles are NOT a frozen feed
+# ---------------------------------------------------------------------------
+
+class TestFreezeDetectionScope:
+    @pytest.fixture(autouse=True)
+    def _force_market_open(self, monkeypatch):
+        import data.market_data_engine as mde
+        monkeypatch.setattr(mde, "fx_market_closed", lambda now=None: False)
+
+    def test_quiet_15m_flat_candles_pass(self, temp_db):
+        """Flat 15m closes in Yahoo's lag zone must not log freeze failures."""
+        flat = _mk_df(15, 300, vary=False)
+        assert validate_ohlcv(flat, "EURUSD", 1800, 15) is None
+
+    def test_frozen_1m_still_flagged(self, temp_db):
+        """Genuine sub-15m freeze (stuck closes, fresh timestamps) still errors."""
+        frozen_1m = _mk_df(1, 60, vary=False)
+        assert validate_ohlcv(frozen_1m, "EURUSD", 960, 1) == "data freeze detected"
+
+    def test_stale_15m_still_flagged(self, temp_db):
+        """Fresh-but-flat is fine; genuinely old data still errors."""
+        old = _mk_df(15, 300, vary=True)
+        old["time"] = old["time"] - pd.Timedelta(hours=2)
+        result = validate_ohlcv(old, "EURUSD", 1800, 15)
+        assert isinstance(result, str) and result.startswith("stale:")
+
+
+class TestFreshnessLimit:
+    def test_sub_15m_gets_16min_floor(self, temp_db, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, "STALENESS_LIMIT_SEC", 600)
+        assert freshness_limit_sec(1) == 960
+
+    def test_15m_gets_two_bars(self, temp_db, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, "STALENESS_LIMIT_SEC", 600)
+        assert freshness_limit_sec(15) == 1800
+
+    def test_setting_can_raise_floor(self, temp_db, monkeypatch):
+        from config import settings
+        monkeypatch.setattr(settings, "STALENESS_LIMIT_SEC", 2000)
+        assert freshness_limit_sec(15) == 2000
 
 
 # ---------------------------------------------------------------------------

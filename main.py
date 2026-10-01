@@ -27,6 +27,7 @@ import time
 from typing import Any, Optional
 
 from config import settings
+from data.market_data_engine import freshness_limit_sec
 from core import db
 from core.event_bus import EventType, bus
 from core.graceful_shutdown import GracefulShutdown
@@ -859,7 +860,11 @@ class TradingSystem:
             if ts.tzinfo is None:
                 ts = ts.tz_localize(timezone.utc)
             feed_age = (datetime.now(timezone.utc) - ts.to_pydatetime()).total_seconds()
-            db.log_feed_health("data_feeds", feed_age <= settings.STALENESS_LIMIT_SEC,
+            # Same freshness contract as the fetch validator (16-min floor for
+            # 15m): the old hard 10-min comparison logged Yahoo's normal lag
+            # as failures ~30% of checks and destabilised the breaker.
+            db.log_feed_health("data_feeds",
+                               feed_age <= freshness_limit_sec(15),
                                f"age {feed_age:.0f}s")
         except Exception as exc:
             feed_age = settings.STALENESS_LIMIT_SEC * 10
