@@ -21,23 +21,32 @@ HEARTBEAT_SEC = 30
 CHILD_BEAT_FILE = Path("/tmp/child.beat")     # written by main.py each cycle
 CHILD_STALE_SEC = 420                          # no beat for 7 min -> hung
 BEAT_FILE = Path("/tmp/engine.beat")
+ROOT = Path(__file__).resolve().parent.parent  # module-level: _write_heartbeat needs it before main() runs
 
 
 def _write_heartbeat() -> None:
-    """Heartbeat: file (always works) + DB state key (best-effort)."""
+    """Heartbeat: file (always works) + DB state key (best-effort).
+
+    The DB write used to fail SILENTLY with a NameError (ROOT was only
+    defined inside main()), so engine_heartbeat in Supabase went stale for
+    days while every dashboard reading it showed OFFLINE. Failures now
+    print to the supervisor log instead of vanishing.
+    """
     try:
         BEAT_FILE.write_text(str(time.time()))
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[run_engine] beat file write failed: {exc}", flush=True)
     try:
-        sys.path.insert(0, str(ROOT))
+        root_s = str(ROOT)
+        if root_s not in sys.path:
+            sys.path.insert(0, root_s)
         from datetime import datetime, timezone
 
         from core.db import set_state
 
         set_state("engine_heartbeat", datetime.now(timezone.utc).isoformat())
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[run_engine] DB heartbeat write failed: {exc}", flush=True)
 
 
 def _child_beat_stale() -> bool:
@@ -52,7 +61,6 @@ def main() -> None:
     # Child stdout+stderr -> /tmp/child.log so /health can surface crashes
     # (Render's log API is unavailable on this workspace).
     logf = open("/tmp/child.log", "a", buffering=1)
-    ROOT = Path(__file__).resolve().parent.parent
     while True:  # supervisor loop: restart engine if it exits OR hangs
         logf.write(f"\n[run_engine] starting engine child: main.py at {time.strftime('%H:%M:%S')}\n")
         print("[run_engine] starting engine child: main.py", flush=True)
