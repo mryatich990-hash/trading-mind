@@ -125,15 +125,24 @@ class CorrelationFilter:
     @staticmethod
     def portfolio_lot_guard(pair: str, direction: str, new_lots: float,
                             open_positions: list[dict]) -> tuple[bool, str]:
-        """Hard guard: EURUSD + GBPUSD combined same-direction lots <= 0.5."""
+        """Hard guard: EURUSD + GBPUSD combined same-direction lots <= 0.5.
+
+        On a flat book the new trade's own lots are exempt: a first position
+        cannot be correlated with itself, and counting it made any tight-SL
+        EURUSD/GBPUSD trade over 0.5 lots (the normal size on a $10k
+        account) auto-reject even with nothing open — silently killing the
+        day's best setups. Once family exposure exists, the new lots count
+        toward the combined cap again (stacking stays blocked).
+        """
         family = {"EURUSD", "GBPUSD"}
         if pair.upper() not in family:
             return True, ""
-        combined = new_lots
+        existing = 0.0
         for pos in open_positions:
             if (str(pos.get("pair", "")).upper() in family
                     and str(pos.get("direction", "")) == direction):
-                combined += float(pos.get("lots", 0) or 0)
+                existing += float(pos.get("lots", 0) or 0)
+        combined = existing + (new_lots if existing > 0 else 0.0)
         if combined > PORTFOLIO_LOT_GUARD:
             return False, (f"EURUSD+GBPUSD same-direction lots {combined:.2f} "
                            f"exceeds {PORTFOLIO_LOT_GUARD}")

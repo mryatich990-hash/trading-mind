@@ -126,6 +126,15 @@ class ExecutionEngine:
                 # that manage/monitor logic would try to track forever)
                 logger.info("limit fill deferred for %s at %.5f; no trade row",
                             verdict.pair, verdict.entry)
+                db.audit("execution", "fill_deferred",
+                         f"{verdict.pair} {verdict.direction} {strategy} limit "
+                         f"{verdict.entry:.5f} not reached; no trade taken",
+                         source="execution_engine")
+                self._notify(
+                    f"⏳ {verdict.pair} {verdict.direction.upper()} limit deferred\n"
+                    f"Strategy: {strategy} | Zone: {verdict.entry:.5f}\n"
+                    f"Price did not return to the zone — no trade taken."
+                )
                 return None
         except BrokerError as exc:
             logger.error("MT5 execution failed: %s", exc)

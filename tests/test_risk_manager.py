@@ -152,6 +152,25 @@ class TestRiskGate:
             [{"pair": "EURUSD", "direction": "buy", "lots": 0.3}])
         assert not ok and "0.5" in why
 
+    def test_portfolio_lot_guard_ignores_own_lots_on_flat_book(self, temp_db):
+        """The new trade's own lots never count: a first EURUSD trade over
+        0.5 lots must NOT be rejected when nothing else is open (the guard
+        counted the new lots against themselves and killed every tight-SL
+        setup on a flat book)."""
+        from risk.correlation_filter import CorrelationFilter
+        ok, why = CorrelationFilter.portfolio_lot_guard(
+            "EURUSD", "sell", 0.66, [])
+        assert ok and why == ""
+
+    def test_portfolio_lot_guard_still_caps_second_family_trade(self, temp_db):
+        """Adding to an existing same-direction family position above 0.5
+        combined is still blocked."""
+        from risk.correlation_filter import CorrelationFilter
+        ok, _ = CorrelationFilter.portfolio_lot_guard(
+            "GBPUSD", "sell", 0.66,
+            [{"pair": "EURUSD", "direction": "sell", "lots": 0.3}])
+        assert not ok
+
     def test_anti_martingale_multiplier_bounds(self, temp_db):
         m = self._mgr()
         mult = m.anti_martingale_multiplier()
