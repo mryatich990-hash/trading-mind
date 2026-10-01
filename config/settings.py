@@ -195,6 +195,11 @@ KELLY_FLOOR_PCT = env_float("KELLY_FLOOR_PCT", 0.25)
 # trades ($250k+ notional on a $10k account). 0.75 lots at the worst observed
 # 2-pip SL loses ~1.4% — still inside MAX_RISK_PER_TRADE_PCT.
 MAX_ABS_LOTS = env_float("MAX_ABS_LOTS", 0.75)
+# Reject stops tighter than N x modeled spread: a stop inside transaction
+# noise is nearly guaranteed to be tagged by spread/slippage, and risk-based
+# sizing on it explodes lots. 3x keeps strategy structural stops (8-20 pips)
+# fully live while killing the 2-4 pip Groq stops (EURJPY #4).
+MIN_SL_SPREAD_MULT = env_float("MIN_SL_SPREAD_MULT", 3.0)
 
 # ---- selector ----
 SELECTOR_MIN_SCORE = env_int("SELECTOR_MIN_SCORE", 70)

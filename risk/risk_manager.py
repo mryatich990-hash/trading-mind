@@ -18,6 +18,7 @@ from typing import Optional
 from config import settings
 from core import db
 from core.logging_utils import get_logger
+from execution.pip_math import spread_pips_of
 from risk.correlation_filter import CorrelationFilter, correlation_of
 from risk.drawdown_manager import DrawdownManager
 from risk.kelly_criterion import KellyCriterion, KellyResult
@@ -233,6 +234,17 @@ class RiskManager:
                 return SizingDecision(False, "effective risk below floor", checks=checks)
 
             sl_pips = abs(entry - sl) / _pip(pair) if entry != sl else 20.0
+            # SL sanity floor: a stop tighter than N x spread is inside
+            # transaction noise (spread + slippage can exceed it) and risk-
+            # based sizing on such stops explodes lots. The production call
+            # passes spread_pips=0.0, so fall back to the modeled spread.
+            modeled_spread = spread_pips or spread_pips_of(pair)
+            min_sl_pips = settings.MIN_SL_SPREAD_MULT * modeled_spread
+            if sl_pips < min_sl_pips:
+                return SizingDecision(
+                    False, f"sl {sl_pips:.1f} pips < {min_sl_pips:.1f} "
+                           f"({settings.MIN_SL_SPREAD_MULT}x spread {modeled_spread:.1f})",
+                    checks=checks)
             lots = lots_for_risk(balance, risk_pct, sl_pips, pair, usdjpy)
             checks["risk_pct"] = round(risk_pct, 2)
             checks["sl_pips"] = round(sl_pips, 1)

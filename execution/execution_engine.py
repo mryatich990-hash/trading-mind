@@ -167,6 +167,20 @@ class ExecutionEngine:
         db.audit("trade", "opened",
                  f"{verdict.pair} {verdict.direction} {lots_f} lots @ {fill['price']:.5f} "
                  f"slippage {slippage_pips:.1f} pips", source="execution_engine")
+        # permanent guard tripwire (runs on Render, no laptop watcher needed):
+        # lots above the cap should be impossible (lots_for_risk clamps), so
+        # this firing means a code path bypassed the risk gate entirely.
+        sl_dist_pips = abs(verdict.entry - verdict.sl) / _pip(verdict.pair)
+        if lots_f > settings.MAX_ABS_LOTS + 1e-9:
+            db.audit("risk", "lot_guard_violation",
+                     f"#{trade_id} {verdict.pair} {verdict.direction} {strategy}: "
+                     f"{lots_f} lots > MAX_ABS_LOTS {settings.MAX_ABS_LOTS}",
+                     source="execution_engine")
+            logger.warning("lot guard violation #%d: %.2f lots > cap %s",
+                           trade_id, lots_f, settings.MAX_ABS_LOTS)
+            self._notify(f"⚠️ SIZING GUARD VIOLATION #{trade_id} {verdict.pair} "
+                         f"{verdict.direction.upper()}: {lots_f} lots > cap "
+                         f"{settings.MAX_ABS_LOTS}")
         self._mirror_shadow(trade_id, verdict, fill["price"], intended)
         counts = db.trade_counts(self.mode)
         self._notify(
@@ -174,6 +188,8 @@ class ExecutionEngine:
             f"Trade #{counts['all_time']} ({counts['today']} today)\n"
             f"Entry: {fill['price']:.5f} | SL: {verdict.sl:.5f} | TP1: {verdict.tp1:.5f} | "
             f"TP2: {verdict.tp2:.5f}\n"
+            f"Sizing: {lots_f:.2f} lots (cap {settings.MAX_ABS_LOTS}) | "
+            f"SL dist {sl_dist_pips:.1f} pips\n"
             f"Conviction: {verdict.conviction}% | Strategy: {strategy}\n"
             f"Confluence: {confluence}/10 | COT: {verdict.macro.cot_bias if verdict.macro else 'n/a'}\n"
             f"Session: {fill.get('session', '')} | Regime: {verdict.regime}"

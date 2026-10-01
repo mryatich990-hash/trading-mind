@@ -121,7 +121,55 @@ class TestGroqSlSanityGate:
         f = ResearchEngine._sl_at_least_as_wide
         assert f(1.1280, 1.1280, 1.12841, "buy") is True
 
-    def test_exact_equal_width_accepted(self):
-        from research.research_engine import ResearchEngine
-        f = ResearchEngine._sl_at_least_as_wide
-        assert f(1.1280, 1.1280, 1.12841, "buy") is True
+
+class TestRiskGateSlFloor:
+    """The risk gate rejects stops tighter than MIN_SL_SPREAD_MULT x spread.
+
+    Last line of defense: even if a strategy's structural stop itself is
+    inside noise, the gate refuses to size such a trade. The production
+    call passes spread_pips=0.0, so the modeled spread from pip_math is
+    used as the reference.
+    """
+
+    @staticmethod
+    def _evaluate(rm, pair, direction, entry, sl, tp,
+                  confluence=8, spread=0.0):
+        return rm.evaluate(pair, direction, "liquidity_sweep", entry, sl, tp,
+                           balance=10000.0, equity=10000.0, used_margin=0.0,
+                           spread_pips=spread, confluence=confluence,
+                           mode="demo")
+
+    def test_trade4_sl_rejected(self, temp_db):
+        """Exact trade #4 geometry: 4.4-pip SL vs EURJPY modeled spread 2.0
+        -> floor 6.0 pips. This trade must now be refused at the gate."""
+        from risk.risk_manager import RiskManager
+        rm = RiskManager()
+        d = self._evaluate(rm, "EURJPY", "sell", 177.676, 177.72, 177.33)
+        assert d.approved is False
+        assert "sl 4.4 pips < 6.0" in d.reason
+
+    def test_structural_sl_passes_floor(self, temp_db):
+        """A 12-pip structural stop clears the floor and proceeds to approval
+        (with the lots cap applying)."""
+        from risk.risk_manager import RiskManager
+        rm = RiskManager()
+        d = self._evaluate(rm, "EURJPY", "sell", 177.676, 177.556, 177.33)
+        assert d.approved is True
+        assert float(d.lots) <= settings.MAX_ABS_LOTS + 1e-9
+
+    def test_explicit_spread_used_when_given(self, temp_db):
+        """A caller-supplied spread takes precedence over the modeled one."""
+        from risk.risk_manager import RiskManager
+        rm = RiskManager()
+        d = self._evaluate(rm, "EURUSD", "buy", 1.1000, 1.0988, 1.1060,
+                           spread=5.0)
+        assert d.approved is False
+        assert "sl 12.0 pips < 15.0" in d.reason
+
+    def test_unknown_pair_fallback_spread(self, temp_db):
+        """Pairs missing from the spread table fall back to 1.5 pips."""
+        from risk.risk_manager import RiskManager
+        rm = RiskManager()
+        d = self._evaluate(rm, "AUDNZD", "sell", 1.0900, 1.0901, 1.0800)
+        assert d.approved is False
+        assert "sl 1.0 pips < 4.5" in d.reason

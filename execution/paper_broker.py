@@ -24,14 +24,12 @@ from core import db
 from core.logging_utils import get_logger
 from execution.pip_math import pip_size as _pip
 from execution.pip_math import pip_value_usd as _pip_value
+from execution.pip_math import spread_pips_of as _spread_pips
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["PaperBroker"]
 
-SPREAD_PIPS = {"EURUSD": 1.0, "GBPUSD": 1.3, "USDJPY": 1.2, "USDCHF": 1.5,
-               "AUDUSD": 1.4, "GBPJPY": 2.5, "EURJPY": 2.0, "XAUUSD": 3.0,
-               "NAS100": 2.0, "US30": 3.0}
 UNIT_SIZE = {"XAUUSD": 100.0, "NAS100": 1.0, "US30": 1.0}  # units per lot
 
 
@@ -98,10 +96,10 @@ class PaperBroker:
         mid = self._mid(pair)
         if mid is None:
             raise RuntimeError(f"paper broker: no price for {pair}")
-        spread = SPREAD_PIPS.get(pair, 1.5) * _pip(pair)
+        spread = _spread_pips(pair) * _pip(pair)
         return {"bid": round(mid - spread / 2, 6),
                 "ask": round(mid + spread / 2, 6),
-                "spread_pips": SPREAD_PIPS.get(pair, 1.5)}
+                "spread_pips": _spread_pips(pair)}
 
     # ---- interface (mirrors OandaConnector) ----
 
