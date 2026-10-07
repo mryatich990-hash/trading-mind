@@ -203,7 +203,10 @@ class ResearchEngine:
                 logger.warning("REJECT [step2-news] %s %s (%s): %s",
                                pair, direction, strategy, reason)
                 verdict.reason = reason
-                db.record_research(pair, "blocked", reason)
+                db.record_research(pair, "blocked", reason,
+                                   research=self._replay_payload(
+                                       direction, signal_entry, signal_sl,
+                                       signal_tp, strategy))
                 return self._finish(verdict, started)
 
             # ---- data frames ----
@@ -231,7 +234,10 @@ class ResearchEngine:
                 logger.warning("REJECT [step3-htf] %s %s (%s): %s",
                                pair, direction, strategy, reason)
                 verdict.reason = reason
-                db.record_research(pair, "rejected", reason)
+                db.record_research(pair, "rejected", reason,
+                                   research=self._replay_payload(
+                                       direction, signal_entry, signal_sl,
+                                       signal_tp, strategy))
                 return self._finish(verdict, started)
 
             # ---- step 8 first: historical rate feeds the checklist requirement ----
@@ -285,7 +291,10 @@ class ResearchEngine:
                 logger.warning("REJECT [step6-confluence] %s %s (%s): %s",
                                pair, direction, strategy, reason)
                 verdict.reason = reason
-                db.record_research(pair, "rejected", reason, checklist.score)
+                db.record_research(pair, "rejected", reason, checklist.score,
+                                   research=self._replay_payload(
+                                       direction, signal_entry, signal_sl,
+                                       signal_tp, strategy))
                 return self._finish(verdict, started)
 
             # ---- step 7 counted via bonus above ----
@@ -304,7 +313,10 @@ class ResearchEngine:
                                "did not agree (or any vote was skip)",
                                pair, direction, strategy)
                 verdict.reason = reason
-                db.record_research(pair, "rejected", reason, checklist.score)
+                db.record_research(pair, "rejected", reason, checklist.score,
+                                   research=self._replay_payload(
+                                       direction, signal_entry, signal_sl,
+                                       signal_tp, strategy))
                 return self._finish(verdict, started)
 
             if str(decision.get("decision", "skip")).lower() != direction:
@@ -315,7 +327,11 @@ class ResearchEngine:
                                decision.get("conviction"), direction)
                 verdict.reason = reason
                 db.record_research(pair, "rejected", reason, checklist.score,
-                                   int(decision.get("conviction", 0)), {"groq": decision})
+                                   int(decision.get("conviction", 0)),
+                                   self._replay_payload(
+                                       direction, signal_entry, signal_sl,
+                                       signal_tp, strategy,
+                                       {"groq": decision}))
                 return self._finish(verdict, started)
 
             verdict.conviction = int(decision.get("conviction", 0))
@@ -362,7 +378,10 @@ class ResearchEngine:
         except Exception as exc:
             logger.exception("research engine failed for %s: %s", pair, exc)
             verdict.reason = f"research error: {exc}"
-            db.record_research(pair, "rejected", verdict.reason[:200])
+            db.record_research(pair, "rejected", verdict.reason[:200],
+                               research=self._replay_payload(
+                                   direction, signal_entry, signal_sl,
+                                   signal_tp, strategy))
             return self._finish(verdict, started)
 
     # ---- step3 mirror retry -------------------------------------------------
@@ -475,6 +494,25 @@ class ResearchEngine:
             atr_v = 6.0 * pip_size(pair)
         buffer = buffer_mult * atr_v
         return entry - buffer if direction == "buy" else entry + buffer
+
+    @staticmethod
+    def _replay_payload(direction: str, entry: float, sl: float, tp: float,
+                        strategy: str, extra: Optional[dict] = None) -> dict:
+        """Direction+prices of a REJECTED setup, for later replay-scoring.
+
+        The funnel rejects ~99% of setups; without the would-be trade's
+        direction and levels there is no way to measure what the gates
+        threw away. Step rejections now store this so a follow-up script
+        can score rejected setups against subsequent price action and
+        quantify whether the strictness (confluence 8, verifier 82) is
+        discarding profits.
+        """
+        payload = {"direction": direction, "strategy": strategy,
+                   "entry": round(entry or 0.0, 6), "sl": round(sl or 0.0, 6),
+                   "tp": round(tp or 0.0, 6)}
+        if extra:
+            payload.update(extra)
+        return payload
 
     @staticmethod
     def _price_or_zero(value) -> float:
