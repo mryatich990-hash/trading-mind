@@ -131,6 +131,16 @@ class PaperBroker:
                      sl: float, tp: float, comment: str = "bot") -> int:
         """Simulated market fill: price ± spread + random adverse slippage."""
         pair = pair.upper()
+        # A stop on the wrong side of entry (buy with SL above, sell with SL
+        # below) would be "hit" immediately and in profit — GBPJPY #5
+        # booked +$73 of fake PnL this way. Refuse it at the door.
+        mid = self._mid(pair)
+        if sl and mid is not None:
+            wrong_side = ((direction == "buy" and sl >= mid)
+                          or (direction == "sell" and sl <= mid))
+            if wrong_side:
+                raise ValueError(
+                    f"paper broker: invalid {direction} SL {sl} vs mid {mid} for {pair}")
         tick = self.tick(pair)
         slippage = random.uniform(0.0, 0.8) * _pip(pair)
         if direction == "buy":

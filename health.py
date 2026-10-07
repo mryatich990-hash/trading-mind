@@ -51,6 +51,26 @@ def _engine_alive() -> bool:
         return False
 
 
+def _mem_snapshot() -> dict:
+    """Process memory + limit for OOM diagnosis (Render 512MB plan).
+
+    OOM kills were invisible in logs (2026-10-05..07 crash loop); this makes
+    the approach to the ceiling observable before the container dies.
+    """
+    try:
+        import resource
+
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss_kb / 1024.0  # Linux reports ru_maxrss in KB
+        return {
+            "rss_mb": round(rss_mb, 1),
+            "limit_mb": 512,
+            "pct": round(rss_mb / 512.0 * 100.0, 1),
+        }
+    except Exception as exc:
+        return {"error": str(exc)[:80]}
+
+
 def _child_beat() -> str:
     """Child-liveness beat (/tmp/child.beat, written by main.py each cycle).
 
@@ -129,6 +149,7 @@ def health():
         "engine": "alive" if _engine_really_alive() else "starting",
         "supervisor": _supervisor_alive(),
         "child_beat": child_beat,
+        "memory": _mem_snapshot(),
         "child_log": _child_log_tail(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })

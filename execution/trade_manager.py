@@ -89,6 +89,22 @@ class TradeManager:
         if price <= 0:
             return
 
+        # CORRUPT-ROW GUARD: a stop on the wrong side of entry (GBPJPY #5:
+        # buy, SL 21.9 pips above entry) poisons every downstream rule —
+        # risk=abs(entry-sl) inflates rr, the TP ladder books fake profit,
+        # and the SL branch would exit at the bogus level in gain. Close the
+        # trade at capped breakeven before any ladder logic can act.
+        if ((direction == "buy" and sl > entry)
+                or (direction == "sell" and sl < entry)):
+            db.audit("risk", "wrong_side_stop_close",
+                     f"#{trade_id} {pair} {direction}: SL {sl} on wrong side "
+                     f"of entry {entry}; closed at breakeven cap",
+                     source="trade_manager")
+            exit_px = entry - _pip(pair) if direction == "buy" \
+                else entry + _pip(pair)
+            self.close(trade, exit_px, "SL", allow_reentry=False)
+            return
+
         risk = abs(entry - sl)
         if risk <= 0:
             return

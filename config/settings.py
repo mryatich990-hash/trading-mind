@@ -200,6 +200,16 @@ MAX_ABS_LOTS = env_float("MAX_ABS_LOTS", 0.75)
 # sizing on it explodes lots. 3x keeps strategy structural stops (8-20 pips)
 # fully live while killing the 2-4 pip Groq stops (EURJPY #4).
 MIN_SL_SPREAD_MULT = env_float("MIN_SL_SPREAD_MULT", 3.0)
+# A strategy stop derived from a structural level (EMA/band) can land on the
+# WRONG side of entry after a deep pullback (GBPJPY #5: buy with SL 21.9 pips
+# ABOVE entry, broker "stopped out" in profit). When research must fall back
+# to the structural stop, it re-anchors it this many ATR(M15) away on the
+# correct side instead of trusting a nonsensical level.
+STRUCTURAL_SL_BUFFER_MULT = env_float("STRUCTURAL_SL_BUFFER_MULT", 2.5)
+# A deferred limit fill (price never returned to the zone) is re-armed for
+# this many minutes; after that the setup is stale and dropped (NAS100 #428:
+# confluence-9 approval lost to an OOM restart with no pending-fill state).
+PENDING_LIMIT_TTL_MIN = env_float("PENDING_LIMIT_TTL_MIN", 45.0)
 
 # ---- selector ----
 SELECTOR_MIN_SCORE = env_int("SELECTOR_MIN_SCORE", 70)

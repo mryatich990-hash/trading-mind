@@ -233,6 +233,18 @@ class RiskManager:
             if risk_pct < settings.MIN_RISK_PER_TRADE_PCT * 0.5:
                 return SizingDecision(False, "effective risk below floor", checks=checks)
 
+            # Wrong-side stop guard: a BUY with SL above entry (or a SELL
+            # with SL below) is not a stop at all — abs() would happily size
+            # against a nonsense level (GBPJPY #5 entered with SL 21.9 pips
+            # above entry and the paper broker "stopped out" in profit).
+            # sl == 0 or sl == entry stays allowed: the caller treats those
+            # as "no usable stop" and the 20-pip default below applies.
+            if sl and entry and entry != sl and (
+                    (direction == "buy" and sl > entry)
+                    or (direction == "sell" and sl < entry)):
+                return SizingDecision(
+                    False, f"wrong-side sl for {direction}: sl {sl} vs "
+                           f"entry {entry}", checks=checks)
             sl_pips = abs(entry - sl) / _pip(pair) if entry != sl else 20.0
             # SL sanity floor: a stop tighter than N x spread is inside
             # transaction noise (spread + slippage can exceed it) and risk-

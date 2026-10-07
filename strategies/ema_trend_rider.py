@@ -51,6 +51,7 @@ class EMATrendRiderStrategy(BaseStrategy):
         e50 = float(e50_series.iloc[-1])
         rsi_v = float(rsi(c, 14).iloc[-1])
         price = ctx.price()
+        atr_v = ctx.atr_m15()
         last = ctx.m15.iloc[-1]
         body = abs(float(last["close"]) - float(last["open"]))
         rng = max(float(last["high"]) - float(last["low"]), 1e-12)
@@ -66,9 +67,14 @@ class EMATrendRiderStrategy(BaseStrategy):
             rejection = float(last["close"]) > float(last["open"]) and body / rng >= 0.4
             if not rejection:
                 return None
+            # SL below price, ALWAYS: in a deep M15 pullback the M15 EMA50 can
+            # sit ABOVE price, which produced GBPJPY #5 (buy, SL 21.9 pips
+            # above entry, broker "stopped out" in profit). ATR-buffered
+            # swing stop is correct-sided by construction.
+            sl = min(last_swing_low(ctx.m15), e50) - 2.0 * atr_v
             return StrategySignal(
                 strategy=self.name, pair=ctx.pair, direction="buy",
-                entry=price, sl=e50 * 0.9995, tp=last_swing_high(ctx.m15),
+                entry=price, sl=sl, tp=last_swing_high(ctx.m15),
                 session=self._session(ctx),
                 confluences=[f"h1_{trend}_ema_stack", "m15_pullback_to_ema20",
                              f"rsi_{rsi_v:.1f}_neutral", "bullish_rejection_candle"],
@@ -77,9 +83,11 @@ class EMATrendRiderStrategy(BaseStrategy):
         rejection = float(last["close"]) < float(last["open"]) and body / rng >= 0.4
         if not rejection:
             return None
+        # mirror image of the buy stop: ABOVE price, always
+        sl = max(last_swing_high(ctx.m15), e50) + 2.0 * atr_v
         return StrategySignal(
             strategy=self.name, pair=ctx.pair, direction="sell",
-            entry=price, sl=e50 * 1.0005, tp=last_swing_low(ctx.m15),
+            entry=price, sl=sl, tp=last_swing_low(ctx.m15),
             session=self._session(ctx),
             confluences=[f"h1_{trend}_ema_stack", "m15_pullback_to_ema20",
                          f"rsi_{rsi_v:.1f}_neutral", "bearish_rejection_candle"],

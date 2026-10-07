@@ -115,7 +115,32 @@ def get_state(key: str, default: str = "") -> str:
         return row[0] if row else default
 
 
+def all_state() -> list[dict]:
+    """All system_state rows as {key, value} dicts (pending-fill scans etc.)."""
+    with _session() as s:
+        rows = s.execute(
+            text(_fix("SELECT key, value FROM system_state"))
+        ).all()
+        return [{"key": r[0], "value": r[1]} for r in rows]
+
+
+def del_state(key: str) -> None:
+    """Delete a state key (idempotent)."""
+    with _session() as s, _WRITE_LOCK:
+        s.execute(text(_fix("DELETE FROM system_state WHERE key = :k")), {"k": key})
+        s.commit()
+
+
 # ---- audit / logging ----
+
+
+def recent_audit(limit: int = 50) -> list[dict]:
+    """Recent audit_log rows, newest first."""
+    with _session() as s:
+        rows = s.execute(
+            text(_fix("SELECT * FROM audit_log ORDER BY id DESC LIMIT :n")),
+            {"n": limit}).mappings().all()
+        return [dict(r) for r in rows]
 
 
 def audit(category: str, action: str, detail: str = "", source: str = "system") -> None:

@@ -572,6 +572,17 @@ class TradingSystem:
         if db.get_state("force_trade_requested", "0") == "1":
             await asyncio.to_thread(self._handle_forced_trade)
 
+        # Re-arm deferred limit fills (persisted under system_state). A
+        # restart used to silently drop them: NAS100 #428 (confluence 9,
+        # conviction 90, 3/3 consensus) was approved and then lost to an
+        # OOM restart before the zone filled.
+        if self.execution is not None and not paused and not observation \
+                and trading_allowed and not weekend_locked:
+            try:
+                await asyncio.to_thread(self.execution.service_pending_fills)
+            except Exception as exc:
+                logger.warning("pending fill service failed: %s", exc)
+
         for pair in settings.TRADING_PAIRS:
             if self.shutdown.shutting_down:
                 return

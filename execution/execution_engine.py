@@ -123,17 +123,22 @@ class ExecutionEngine:
             if fill.get("deferred"):
                 # limit zone not reached yet: NO trade row (a deferred fill is
                 # not a position — recording one creates phantom open trades
-                # that manage/monitor logic would try to track forever)
+                # that manage/monitor logic would try to track forever).
+                # PERSIST the pending setup so a restart (OOM kills happen
+                # ~daily on the 512MB plan; NAS100 #428 lost a confluence-9
+                # approval this way) does not silently drop it.
                 logger.info("limit fill deferred for %s at %.5f; no trade row",
                             verdict.pair, verdict.entry)
                 db.audit("execution", "fill_deferred",
                          f"{verdict.pair} {verdict.direction} {strategy} limit "
                          f"{verdict.entry:.5f} not reached; no trade taken",
                          source="execution_engine")
+                self._save_pending_fill(verdict, lots_f)
                 self._notify(
                     f"⏳ {verdict.pair} {verdict.direction.upper()} limit deferred\n"
                     f"Strategy: {strategy} | Zone: {verdict.entry:.5f}\n"
-                    f"Price did not return to the zone — no trade taken."
+                    f"Price did not return to the zone — armed for "
+                    f"{settings.PENDING_LIMIT_TTL_MIN:.0f} min."
                 )
                 return None
         except BrokerError as exc:
@@ -202,6 +207,120 @@ class ExecutionEngine:
                     verdict.pair, verdict.direction, lots_f, fill["price"],
                     slippage_pips, trade_id)
         return trade_id
+
+    # ---- pending limit fills (survive restarts) ----
+
+    def _save_pending_fill(self, verdict: ResearchVerdict, lots: float) -> None:
+        """Persist a deferred limit fill under system_state.
+
+        Keyed by signal hash so repeated deferrals of the same setup refresh
+        rather than duplicate. _list_pending fills scan every entry.
+        """
+        import json as _json
+        from datetime import datetime, timezone
+        try:
+            key = f"pending_fill_{_hash_signal(verdict)}"
+            payload = {
+                "pair": verdict.pair, "direction": verdict.direction,
+                "strategy": verdict.strategy, "entry": verdict.entry,
+                "sl": verdict.sl, "tp1": verdict.tp1, "tp2": verdict.tp2,
+                "tp3": verdict.tp3, "lots": lots,
+                "confluence": verdict.confluence, "conviction": verdict.conviction,
+                "consensus_size": verdict.consensus_size,
+                "size_multipliers": verdict.size_multipliers,
+                "regime": verdict.regime,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            db.set_state(key, _json.dumps(payload))
+        except Exception as exc:
+            logger.warning("pending fill save failed: %s", exc)
+
+    def service_pending_fills(self) -> int:
+        """Re-arm deferred fills after a restart.
+
+        Called from the trading cycle. For every stored pending fill inside
+        the TTL: if price is now at/beyond the zone, execute it immediately
+        (market path) — the research approval already happened. Expired
+        entries are dropped with an audit row. Returns fills executed.
+        """
+        import json as _json
+        from datetime import datetime, timezone
+        executed = 0
+        try:
+            rows = db.all_state()
+        except Exception as exc:
+            logger.warning("pending fill scan failed: %s", exc)
+            return 0
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            key = row.get("key", "")
+            if not key.startswith("pending_fill_"):
+                continue
+            try:
+                p = _json.loads(row.get("value", "{}"))
+                created = datetime.fromisoformat(p["created_at"])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age_min = (now - created).total_seconds() / 60.0
+            except Exception:
+                db.del_state(key)
+                continue
+            if age_min > settings.PENDING_LIMIT_TTL_MIN:
+                db.audit("execution", "pending_fill_expired",
+                         f"{p.get('pair')} {p.get('direction')} {p.get('strategy')} "
+                         f"zone {p.get('entry')} expired after {age_min:.0f} min",
+                         source="execution_engine")
+                db.del_state(key)
+                continue
+            try:
+                price_now = self._current_price(p["pair"])
+            except Exception:
+                continue
+            if not price_now:
+                continue
+            at_zone = (p["direction"] == "buy" and price_now <= p["entry"] + 2 * _pip(p["pair"])) \
+                or (p["direction"] == "sell" and price_now >= p["entry"] - 2 * _pip(p["pair"]))
+            if not at_zone:
+                continue  # still waiting; stays armed
+            verdict = ResearchVerdict(
+                pair=p["pair"], direction=p["direction"], strategy=p["strategy"],
+                approved=True, reason="pending fill re-armed after restart",
+                entry=p["entry"], sl=p["sl"], tp1=p["tp1"], tp2=p["tp2"],
+                tp3=p["tp3"], confluence=int(p.get("confluence", 8)),
+                conviction=int(p.get("conviction", 0)),
+                consensus_size=float(p.get("consensus_size", 1.0)),
+                regime=p.get("regime", "unknown"))
+            from decimal import Decimal as _Dec
+            broker = self.active_broker()
+            if broker is None:
+                continue
+            try:
+                with self._lock:
+                    fill = self._market_fill(broker, verdict, float(p["lots"]))
+                slippage_pips = abs(fill["price"] - verdict.entry) / _pip(verdict.pair)
+                trade_id = db.record_trade(
+                    pair=verdict.pair, direction=verdict.direction, lots=float(p["lots"]),
+                    entry=fill["price"], sl=verdict.sl, tp=verdict.tp1,
+                    strategy=verdict.strategy, session=fill.get("session", ""),
+                    confluence=verdict.confluence, conviction=verdict.conviction,
+                    reasoning="re-armed pending fill (approved pre-restart)",
+                    signal_hash=key.replace("pending_fill_", ""), mode=self.mode,
+                    tp2=verdict.tp2, tp3=verdict.tp3,
+                    features={"consensus_size": verdict.consensus_size,
+                              "regime": verdict.regime,
+                              "invalidation": 0.0})
+                db.audit("trade", "opened",
+                         f"{verdict.pair} {verdict.direction} {float(p['lots'])} lots @ "
+                         f"{fill['price']:.5f} (re-armed pending fill, slippage "
+                         f"{slippage_pips:.1f} pips)", source="execution_engine")
+                db.del_state(key)  # consumed
+                executed += 1
+                self._notify(f"⏫ {verdict.pair} {verdict.direction.upper()} pending "
+                             f"fill executed at {fill['price']:.5f} "
+                             f"(zone {verdict.entry:.5f}, armed pre-restart)")
+            except Exception as exc:
+                logger.warning("pending fill execution failed for %s: %s", p.get("pair"), exc)
+        return executed
 
     # ---- fill styles ----
 

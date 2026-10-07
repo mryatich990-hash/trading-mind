@@ -150,10 +150,12 @@ class TestRiskGateSlFloor:
 
     def test_structural_sl_passes_floor(self, temp_db):
         """A 12-pip structural stop clears the floor and proceeds to approval
-        (with the lots cap applying)."""
+        (with the lots cap applying). Stop must be ABOVE entry for a sell —
+        the pre-wrong-side-guard version of this test passed 177.556 (below
+        entry), which the gate now correctly rejects."""
         from risk.risk_manager import RiskManager
         rm = RiskManager()
-        d = self._evaluate(rm, "EURJPY", "sell", 177.676, 177.556, 177.33)
+        d = self._evaluate(rm, "EURJPY", "sell", 177.676, 177.796, 177.33)
         assert d.approved is True
         assert float(d.lots) <= settings.MAX_ABS_LOTS + 1e-9
 

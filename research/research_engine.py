@@ -29,7 +29,9 @@ from ai.groq_verifier import GroqVerifier
 from config import settings
 from core import db
 from core.logging_utils import get_logger
+from strategies.base_strategy import atr
 from data.market_data_engine import MarketDataEngine
+from execution.pip_math import pip_size
 from research.entry_validator import EntryChecklist, EntryValidator
 from research.historical_matcher import HistoricalMatcher
 from research.htf_analyzer import HTFAnalyzer, HTFResult
@@ -58,6 +60,7 @@ class ResearchVerdict:
     tp1: float = 0.0
     tp2: float = 0.0
     tp3: float = 0.0
+    struct_sl_fixed: bool = False
     invalidation: float = 0.0
     regime: str = "unknown"
     conviction: int = 0
@@ -334,7 +337,13 @@ class ResearchEngine:
                                                      verdict.entry, direction):
                 verdict.sl = groq_sl
             else:
-                verdict.sl = signal_sl
+                # Fallback to the structural stop — but never to a stop that
+                # is zero or on the WRONG side of entry (GBPJPY #5: buy with
+                # SL 21.9 pips ABOVE entry; deep M15 pullback put the M15
+                # EMA50 above price and the fallback reinstated it).
+                verdict.sl = self._sanitize_structural_sl(
+                    pair, signal_sl, verdict.entry, direction, frames)
+                verdict.struct_sl_fixed = verdict.sl != signal_sl
             verdict.tp1 = self._price_or_zero(decision.get("tp1")) or signal_tp
             risk = abs(verdict.entry - verdict.sl)
             verdict.tp2 = self._price_or_zero(decision.get("tp2")) or \
@@ -344,7 +353,8 @@ class ResearchEngine:
 
             verdict.approved = True
             verdict.reason = (f"approved: confluence {checklist.score}, conviction "
-                              f"{verdict.conviction}, consensus {decision.get('_consensus')}/3")
+                              f"{verdict.conviction}, consensus {decision.get('_consensus')}/3"
+                              + (" [structural SL re-anchored]" if verdict.struct_sl_fixed else ""))
             db.record_research(pair, "accepted", verdict.reason, checklist.score,
                                verdict.conviction, {"groq": decision})
             return self._finish(verdict, started)
@@ -437,6 +447,34 @@ class ResearchEngine:
         best = max(agreeing, key=lambda r: int(r.get("conviction", 0)))
         best["_consensus"] = len(agreeing)
         return best
+
+    @staticmethod
+    def _sanitize_structural_sl(pair: str, signal_sl: float, entry: float,
+                                direction: str, frames: dict) -> float:
+        """Return a usable structural stop, never a wrong-sided one.
+
+        A strategy stop derived from a structural level (EMA, band, prior
+        swing) can land on the wrong side of entry after a deep pullback.
+        Zero stops and wrong-side stops are re-anchored on the correct side
+        at STRUCTURAL_SL_BUFFER_MULT x ATR(M15) from entry; correct-sided
+        stops pass through untouched.
+        """
+        if signal_sl > 0 and ((direction == "buy" and signal_sl < entry)
+                              or (direction == "sell" and signal_sl > entry)):
+            return signal_sl
+        buffer_mult = settings.STRUCTURAL_SL_BUFFER_MULT
+        atr_v = 0.0
+        try:
+            m15 = frames.get("m15")
+            if m15 is not None and len(m15) >= 20:
+                atr_v = float(atr(m15, 14).iloc[-1])
+        except Exception:
+            atr_v = 0.0
+        if atr_v <= 0:
+            # no ATR available: 15 pips equivalent as a conservative floor
+            atr_v = 6.0 * pip_size(pair)
+        buffer = buffer_mult * atr_v
+        return entry - buffer if direction == "buy" else entry + buffer
 
     @staticmethod
     def _price_or_zero(value) -> float:
